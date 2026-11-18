@@ -1,0 +1,349 @@
+name: Strata CUDA 13.2 / sm_120
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Upstream Strata release (blank = latest stable, e.g. v0.2.15)"
+        required: false
+        type: string
+      rebuild_existing:
+        description: "Rebuild existing release to update Engine + Server archive layout"
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: "17 */6 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: strata-cuda132-sm120
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    name: Compile and publish Linux x86_64 engine
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      RELEASE_PREFIX: strata-sm120-cuda13.2-
+      KEEP_RELEASES: "3"
+
+    steps:
+      - name: Resolve upstream release
+        id: upstream
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$REQUESTED_TAG" ]]; then
+            tag="$REQUESTED_TAG"
+          else
+            tag="$(gh api repos/Niko1221/Strata/releases/latest --jq '.tag_name')"
+          fi
+          if [[ ! "$tag" =~ ^v[0-9]+(\.[0-9]+){1,3}([.-][A-Za-z0-9.-]+)?$ ]]; then
+            echo "::error::Unexpected Strata release tag: $tag"
+            exit 1
+          fi
+          gh api "repos/Niko1221/Strata/releases/tags/$tag" >/dev/null
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$RELEASE_PREFIX$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Check for an existing custom release
+        id: existing
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.upstream.outputs.release_tag }}
+          REBUILD_EXISTING: ${{ inputs.rebuild_existing }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            if [[ "$REBUILD_EXISTING" == "true" ]]; then
+              echo "Replacing existing release assets after successful build."
+            else
+              echo "Release already exists; skipping build."
+            fi
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout exact upstream source tag
+        if: steps.existing.outputs.published != 'true' || inputs.rebuild_existing == true
+        uses: actions/checkout@v4
+        with:
+          repository: Niko1221/Strata
+          ref: ${{ steps.upstream.outputs.tag }}
+          path: strata
+          persist-credentials: false
+
+      - name: Free space and inspect runner
+        if: steps.existing.outputs.published != 'true' || inputs.rebuild_existing == true
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android \
+            /usr/local/share/powershell /usr/local/.ghcup /opt/ghc \
+            /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+          df -h /
+
+      - name: Install CUDA 13.2 and dependencies
+        if: steps.existing.outputs.published != 'true' || inputs.rebuild_existing == true
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ca-certificates curl git libssl-dev pkg-config \
+            gcc-13 g++-13 python3-venv python3-pip
+          curl -fsSL \
+            https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb \
+            -o "$RUNNER_TEMP/cuda-keyring.deb"
+          sudo dpkg -i "$RUNNER_TEMP/cuda-keyring.deb"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cuda-compiler-13-2 cuda-libraries-dev-13-2
+          sudo ln -sfn /usr/local/cuda-13.2 /usr/local/cuda
+          echo "/usr/local/cuda-13.2/bin" >> "$GITHUB_PATH"
+          echo "LD_LIBRARY_PATH=/usr/local/cuda-13.2/lib64" >> "$GITHUB_ENV"
+          /usr/local/cuda-13.2/bin/nvcc --version | tee "$RUNNER_TEMP/nvcc.txt"
+          grep -q 'release 13\.2' "$RUNNER_TEMP/nvcc.txt" || {
+            echo "::error::Expected CUDA Toolkit 13.2"
+            exit 1
+          }
+          df -h /
+
+      - name: Build engine and vision for sm_120
+        if: steps.existing.outputs.published != 'true' || inputs.rebuild_existing == true
+        shell: bash
+        working-directory: strata
+        env:
+          VARIANT: cuda13
+          ARCHS: "120"
+          BUILD_VISION: "1"
+        run: |
+          set -euo pipefail
+          python3 -m venv .venv
+          . .venv/bin/activate
+          # Use a pinned Linux CUDA build toolchain.
+          python -m pip install --no-cache-dir -r requirements.txt
+          python -m pip install --no-cache-dir cmake==4.2.3 ninja==1.13.2
+          export CC=/usr/bin/gcc-13
+          export CXX=/usr/bin/g++-13
+          export CUDAHOSTCXX=/usr/bin/g++-13
+          export CUDACXX=/usr/local/cuda-13.2/bin/nvcc
+          export STRATA_CMAKE_EXTRA="-DCUDAToolkit_ROOT=/usr/local/cuda-13.2"
+          cmake --version | head -n1
+          ninja --version
+          gcc-13 -dumpfullversion
+          # Upstream CUDA13 recipe hardcodes min_driver=580.65; correct this
+          # one manifest field for CUDA 13.2 Update 2 before packaging and hashing.
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("packaging/build_cuda_linux.sh")
+          data = p.read_text(encoding="utf-8")
+          old = "cuda13) archs=${ARCHS:-75;86;89;120}; mindriver=580.65; sm60=OFF ;;"
+          new = "cuda13) archs=${ARCHS:-75;86;89;120}; mindriver=595.71.05; sm60=OFF ;;"
+          if data.count(old) == 1:
+              p.write_text(data.replace(old, new), encoding="utf-8")
+              print("CUDA 13.2 min_driver metadata: 595.71.05")
+          elif data.count(new) == 1:
+              print("Upstream min_driver already set to 595.71.05")
+          else:
+              raise SystemExit("Unexpected upstream driver metadata; refusing to build")
+          PY
+          export PYTHON="$PWD/.venv/bin/python"
+          export OUT="$RUNNER_TEMP/strata-package"
+          export BUILD="$RUNNER_TEMP/strata-build"
+          export BUILD_VISION_DIR="$RUNNER_TEMP/strata-vision-build"
+          sh packaging/build_cuda_linux.sh
+          df -h /
+
+      - name: Verify, archive, and checksum
+        id: package
+        if: steps.existing.outputs.published != 'true' || inputs.rebuild_existing == true
+        shell: bash
+        env:
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          set -euo pipefail
+          package_root="$RUNNER_TEMP/strata-package"
+          count="$(find "$package_root" -mindepth 1 -maxdepth 1 -type d | wc -l)"
+          if [[ "$count" -ne 1 ]]; then
+            echo "::error::Expected one engine package folder, found $count"
+            exit 1
+          fi
+          package="$(find "$package_root" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+          test -x "$package/strata"
+          test -x "$package/strata-vision"
+          python3 strata/packaging/package_engine.py --verify "$package"
+          python3 - "$package" <<'PY'
+          import json, pathlib, sys
+          root = pathlib.Path(sys.argv[1])
+          build = json.loads((root / "BUILD.json").read_text())
+          manifest = json.loads((root / "engine-component.json").read_text())
+          assert build["cuda"] == "13.2", build
+          assert build["archs"] == "120", build
+          assert build["vision_archs"] == "120", build
+          assert "sm_120" in manifest["archs"], manifest["archs"]
+          assert "compute_120" in manifest["archs"], manifest["archs"]
+          assert manifest["min_driver"]["nvidia"] == "595.71.05", manifest
+          assert manifest.get("signature") is None, "Custom build should be unsigned"
+          for lib in ("libcudart.so.13", "libcublas.so.13", "libcublasLt.so.13"):
+              p = root / lib
+              assert p.is_file() and not p.is_symlink(), f"Required physical CUDA library missing: {lib}"
+              print(f"Bundled CUDA file: {lib}: {p.stat().st_size} bytes")
+          links = [str(p.relative_to(root)) for p in root.rglob("*") if p.is_symlink()]
+          assert not links, f"Package must not contain symlinks: {links}"
+          print("Verified CUDA 13.2, SM120, Vision, driver 595.71.05, and real CUDA libraries")
+          PY
+          # Unified release layout: v0.2.14 -> strata-v0214-sm120/ + server-v0214/.
+          source_commit="$(git -C strata rev-parse HEAD)"
+          compact_version="$(printf '%s' "$UPSTREAM_TAG" | sed 's/^v//; s/\.//g')"
+          [[ "$compact_version" =~ ^[0-9]+[A-Za-z0-9-]*$ ]] || {
+            echo "::error::Unsafe version directory suffix: $compact_version"
+            exit 1
+          }
+          engine_dir="strata-v$compact_version-sm120"
+          server_dir="server-v$compact_version"
+          bundle_root="$RUNNER_TEMP/strata-unified-release"
+          mkdir -p "$bundle_root/$engine_dir" "$bundle_root/$server_dir"
+          cp -a "$package/." "$bundle_root/$engine_dir/"
+
+          # Include the matching Web/API server from the exact upstream tag.
+          cp -a strata/serve strata/strata_control strata/tools "$bundle_root/$server_dir/"
+          cp -a strata/requirements.txt strata/strata.py "$bundle_root/$server_dir/"
+          printf '%s\n' "$source_commit" > "$bundle_root/$server_dir/SOURCE-SHA.txt"
+          test -f "$bundle_root/$server_dir/serve/server.py"
+          test -f "$bundle_root/$server_dir/serve/web/index.html"
+          test -f "$bundle_root/$server_dir/serve/web/app.js"
+          test -f "$bundle_root/$server_dir/strata_control/__init__.py"
+          test -f "$bundle_root/$server_dir/strata.py"
+          test -f "$bundle_root/$server_dir/requirements.txt"
+          python3 strata/packaging/package_engine.py --verify "$bundle_root/$engine_dir"
+
+          archive="strata-engine-$UPSTREAM_TAG-cuda13.2-sm120-linux-x86_64.tar.gz"
+          mkdir -p dist
+          tar -czf "dist/$archive" -C "$bundle_root" "$engine_dir" "$server_dir"
+          python3 - "dist/$archive" "$engine_dir" "$server_dir" <<'PY'
+          import sys, tarfile
+          archive, engine, server = sys.argv[1:]
+          with tarfile.open(archive, "r:gz") as tar:
+              members = tar.getmembers()
+              roots = {m.name.split("/", 1)[0] for m in members}
+              assert roots == {engine, server}, f"Unexpected roots: {roots}"
+              assert not any(m.issym() or m.islnk() for m in members), "Archive contains symlinks"
+              required = (
+                  f"{engine}/strata", f"{engine}/strata-vision",
+                  f"{engine}/libcudart.so.13", f"{engine}/libcublas.so.13",
+                  f"{engine}/libcublasLt.so.13", f"{engine}/engine-component.json",
+                  f"{engine}/SYSTEM-LIBS.txt",
+                  f"{server}/serve/server.py", f"{server}/serve/web/index.html",
+                  f"{server}/serve/web/app.js", f"{server}/strata.py",
+                  f"{server}/requirements.txt", f"{server}/SOURCE-SHA.txt",
+              )
+              names = {m.name for m in members}
+              missing = [name for name in required if name not in names]
+              assert not missing, f"Missing archive entries: {missing}"
+          print(f"Verified archive: {engine}/ + {server}/")
+          PY
+          (cd dist && sha256sum "$archive" > SHA256SUMS.txt)
+          printf 'Upstream: Niko1221/Strata %s\nCommit: %s\nCUDA Toolkit: 13.2\nArch: sm_120 + compute_120\nVision: yes\nMinimum NVIDIA driver: 595.71.05 (one-line patch to upstream recipe)\nArchive folders: %s/ %s/\nSigned: no\n' \
+            "$UPSTREAM_TAG" "$source_commit" "$engine_dir" "$server_dir" > dist/BUILD-SOURCE.txt
+          {
+            printf 'OS: '; . /etc/os-release; printf '%s %s\n' "$NAME" "$VERSION_ID"
+            printf 'GLIBC: '; getconf GNU_LIBC_VERSION
+            printf 'GCC: '; gcc-13 -dumpfullversion
+            printf 'CMake: '; strata/.venv/bin/cmake --version | head -n1
+            printf 'Ninja: '; strata/.venv/bin/ninja --version
+            printf 'NVCC: '; /usr/local/cuda-13.2/bin/nvcc --version | grep 'release 13.2'
+          } >> dist/BUILD-SOURCE.txt
+          if (( $(stat -c%s "dist/$archive") >= 2147483648 )); then
+            echo "::error::Archive exceeds GitHub's 2 GiB per-asset limit"
+            exit 1
+          fi
+          echo "archive=dist/$archive" >> "$GITHUB_OUTPUT"
+          du -h dist/*
+          df -h /
+
+      - name: Publish verified build in GitHub Releases
+        if: steps.existing.outputs.published != 'true' || inputs.rebuild_existing == true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.upstream.outputs.release_tag }}
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+          REBUILD_EXISTING: ${{ inputs.rebuild_existing }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/release-notes.md" <<EOF
+          Unofficial Strata Engine build from upstream tag $UPSTREAM_TAG.
+
+          - Linux x86-64; CUDA Toolkit **13.2**
+          - NVIDIA **sm_120 + compute_120**
+          - Minimum NVIDIA driver: **595.71.05** (recorded in the hashed package manifest)
+          - Toolchain: Ubuntu 24.04, GCC 13, CMake 4.2.3, Ninja 1.13.2
+          - CUDA userspace libraries are physical files, not symlinks; glibc and the NVIDIA driver remain host-provided
+          - Includes \`strata\`, \`strata-vision\`, required CUDA libraries
+          - Source commit: \`BUILD-SOURCE.txt\`
+          - Archive SHA-256: \`SHA256SUMS.txt\`
+          - **Unsigned**; not part of the official Strata signed update feed
+          - One archive: strata-vNNNN-sm120/ (Engine + Vision) and server-vNNNN/ (Python API + Web UI)
+          - Server source: serve/, strata_control/, tools/, strata.py, requirements.txt, SOURCE-SHA.txt
+          - **No GPU execution test** on the GitHub runner
+          EOF
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if [[ "$REBUILD_EXISTING" != "true" ]]; then
+              echo "::error::Cannot replace an existing release without rebuild_existing=true"
+              exit 1
+            fi
+            # Keep existing release until the complete new archive is validated.
+            gh release upload "$RELEASE_TAG" \
+              "$ARCHIVE" dist/SHA256SUMS.txt dist/BUILD-SOURCE.txt \
+              --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --notes-file "$RUNNER_TEMP/release-notes.md"
+          else
+            gh release create "$RELEASE_TAG" \
+              "$ARCHIVE" dist/SHA256SUMS.txt dist/BUILD-SOURCE.txt \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "Strata $UPSTREAM_TAG - CUDA 13.2 sm_120" \
+              --notes-file "$RUNNER_TEMP/release-notes.md" --prerelease
+          fi
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets | length' | grep -qx '3'
+
+      - name: Retain only the three latest successful builds
+        if: success() && (steps.existing.outputs.published != 'true' || inputs.rebuild_existing == true)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.upstream.outputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 \
+            --json tagName,publishedAt,isDraft \
+            > "$RUNNER_TEMP/releases.json"
+          jq -r --arg prefix "$RELEASE_PREFIX" --argjson keep "$KEEP_RELEASES" \
+            '[.[] | select(.isDraft == false and (.tagName | startswith($prefix)))] |
+             sort_by(.publishedAt) | reverse | .[$keep:][] | .tagName' \
+             "$RUNNER_TEMP/releases.json" > "$RUNNER_TEMP/old-releases.txt"
+          while IFS= read -r tag; do
+            [[ -n "$tag" ]] || continue
+            [[ "$tag" != "$RELEASE_TAG" ]] || {
+              echo "::error::Refusing to remove the just-published release"
+              exit 1
+            }
+            gh release delete "$tag" --repo "$GITHUB_REPOSITORY" \
+              --yes --cleanup-tag
+          done < "$RUNNER_TEMP/old-releases.txt"
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 20
