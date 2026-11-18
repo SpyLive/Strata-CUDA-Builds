@@ -89,6 +89,43 @@ journalctl -u strata-updater.service -f
 
 The default local API is `http://127.0.0.1:8090`. To use another port, pass `--api-url http://127.0.0.1:PORT` when installing. No separate updater configuration file is required.
 
+## Automatic updater (optional)
+
+The single-file `strata-updater.py` installs a persistent `strata-updater.service` for Linux hosts. It checks this repository every 12 hours, downloads and verifies new builds, waits for the model to unload, updates the Engine and Server, checks service startup, and retains the two most recent installed releases. Failed installations are rolled back.
+
+**Minimum requirements:** Linux with systemd and sudo; Python 3.12 or newer; an existing `strata.service` running as the installing non-root user; writable, real directories `~/strata/strata-sm120/` and `~/strata/server/`. The Strata service must use these stable locations for Engine and Server, and provide the local API at `http://127.0.0.1:8090` (configurable with `--api-url`). Model data and configuration are not managed by the updater.
+
+Install as the same ordinary user that runs `strata.service` (**do not prefix the whole command with `sudo`**):
+
+```bash
+tmp=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/SpyLive/Strata-CUDA-Builds/main/strata-updater.py -o "$tmp" && python3 "$tmp" --install; rm -f "$tmp"
+```
+
+Watch live stages and download progress (every 5%) in systemd's journal:
+
+```bash
+journalctl -u strata-updater.service -f
+```
+
+Show the state or request an immediate release check:
+
+```bash
+python3 ~/.local/bin/strata-updater.py --status
+python3 ~/.local/bin/strata-updater.py --check-now
+```
+
+To upgrade an already installed updater, repeat the install command above, **then restart the updater service when no installation is in progress**:
+
+```bash
+sudo systemctl restart strata-updater.service
+```
+
+Uninstall (leaves Strata files, models, and updater state untouched):
+
+```bash
+python3 ~/.local/bin/strata-updater.py --uninstall
+```
+
 ## Compatibility and security
 
 The resulting binaries are **unsigned unofficial builds**, not part of the official Strata signed update feed. GitHub-hosted runners do not perform GPU execution tests. Validate the engine and vision features on a supported GPU before production use.
