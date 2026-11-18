@@ -347,12 +347,17 @@ def can_stop(base):
 
 def wait_for_idle(systemctl, base):
     last_report = -float("inf")
+    last_self_check = time.monotonic()
     while True:
-        # Safe to upgrade the updater while waiting; Strata files are unchanged.
-        if SELF_UPDATE_REQUESTED.is_set():
+        # While waiting for the model, continue checking updater source every 12 hours.
+        # No Strata files have been switched at this point.
+        now = time.monotonic()
+        requested = SELF_UPDATE_REQUESTED.is_set()
+        if requested or now - last_self_check >= INTERVAL:
             SELF_UPDATE_REQUESTED.clear()
+            last_self_check = now
             try:
-                if not perform_self_update(base):
+                if not perform_self_update(base) and requested:
                     log("[SELF-UPDATE] Updater already current")
             except Exception as exc:
                 log(f"[SELF-UPDATE] Check failed: {exc}")
