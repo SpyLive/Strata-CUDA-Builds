@@ -79,6 +79,8 @@ With updater **v1.0.2 or newer**, this command requests an immediate self-update
 
 **One-time upgrade from updater v1.0.1 (without `--update`):** repeat the install command above and then, when no Strata update is in progress, run `sudo systemctl restart strata-updater.service`. Future updater upgrades use `--update` directly.
 
+**Repair a service installed by v1.0.2 that fails with `WorkingDirectory= path is not absolute`:** rerun the install command above. Version **1.0.3+** regenerates a valid systemd unit, validates it before installation, and confirms that the updater service started. `--update` cannot repair this case while the updater service is stopped.
+
 **Monitor progress, check status, or request a Strata-release check:**
 
 ```bash
