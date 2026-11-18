@@ -27,7 +27,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 REPO = "SpyLive/Strata-CUDA-Builds"
 PREFIX = "strata-sm120-cuda13.2-"
 SERVICE = "strata.service"
@@ -712,7 +712,7 @@ RequiresMountsFor={base}
 Type=simple
 User={username}
 Group={grp.getgrgid(account.pw_gid).gr_name}
-WorkingDirectory={systemd_quote(str(base))}
+WorkingDirectory={base}
 ExecStart={systemd_quote(sys.executable)} {systemd_quote(str(path))} --run --api-url {systemd_quote(api_url)}
 Environment=PYTHONDONTWRITEBYTECODE=1
 Restart=on-failure
@@ -727,17 +727,22 @@ WantedBy=multi-user.target
     unit_file = Path(f"/etc/systemd/system/{UPDATER}")
     with tempfile.TemporaryDirectory(prefix="strata-updater-install-") as d:
         work = Path(d)
-        unit_tmp, sudo_tmp = work / "unit", work / "sudoers"
+        unit_tmp, sudo_tmp = work / UPDATER, work / "sudoers"
         unit_tmp.write_text(unit, encoding="utf-8")
         sudo_tmp.write_text(rule, encoding="utf-8")
         run_command(["sudo", "-v"], timeout=120)
         # Validate a temporary candidate before installing a privileged policy.
         run_command(["sudo", "/usr/sbin/visudo", "-cf", str(sudo_tmp)])
+        analyzer = shutil.which("systemd-analyze")
+        if analyzer:
+            run_command([analyzer, "verify", str(unit_tmp)])
         sudo_install(sudo_tmp, sudo_file, "0440")
         sudo_install(unit_tmp, unit_file, "0644")
         run_command(["sudo", systemctl, "daemon-reload"])
         run_command(["sudo", systemctl, "enable", "--now", UPDATER])
-    log(f"Installed {UPDATER} for user {username}; release root: {base}")
+        if run_command([systemctl, "is-active", "--quiet", UPDATER], check=False).returncode:
+            raise RuntimeError(f"{UPDATER} was installed but did not start; inspect journalctl -u {UPDATER} -n 50")
+    log(f"Installed and started {UPDATER} for user {username}; release root: {base}")
 
 
 def uninstall_self():
