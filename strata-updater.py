@@ -348,6 +348,14 @@ def can_stop(base):
 def wait_for_idle(systemctl, base):
     last_report = -float("inf")
     while True:
+        # Safe to upgrade the updater while waiting; Strata files are unchanged.
+        if SELF_UPDATE_REQUESTED.is_set():
+            SELF_UPDATE_REQUESTED.clear()
+            try:
+                if not perform_self_update(base):
+                    log("[SELF-UPDATE] Updater already current")
+            except Exception as exc:
+                log(f"[SELF-UPDATE] Check failed: {exc}")
         active = service_state(systemctl)
         if active == "inactive":
             log("[WAIT] Strata is stopped; a temporary verification start will follow installation")
@@ -625,11 +633,22 @@ def run_daemon(root, api_url):
 
     def wake(signum, frame):
         WAKE.set()
+    def update_requested(signum, frame):
+        SELF_UPDATE_REQUESTED.set()
+        WAKE.set()
     signal.signal(signal.SIGUSR1, wake)
+    signal.signal(signal.SIGUSR2, update_requested)
     log(f"[START] Updater {VERSION} started; release checks every 12 hours")
     while True:
         try:
             restore_transaction(root, state, systemctl)
+            requested = SELF_UPDATE_REQUESTED.is_set()
+            SELF_UPDATE_REQUESTED.clear()
+            try:
+                if not perform_self_update(api_url) and requested:
+                    log("[SELF-UPDATE] Updater already current")
+            except Exception as exc:
+                log(f"[SELF-UPDATE] Check failed: {exc}")
             log("[CHECK] Checking GitHub releases")
             _, release, archive, checksums = releases()
             state["last_checked_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -738,12 +757,45 @@ def uninstall_self():
     log("Updater removed; Strata, release folders and updater state were left untouched")
 
 
+
+def manual_self_update():
+    """Request daemon update and wait briefly; never interrupt a Strata installation."""
+    if os.geteuid() == 0:
+        raise RuntimeError("Run --update as the service owner, without sudo")
+    path = home() / ".local/bin/strata-updater.py"
+    if not path.is_file():
+        raise RuntimeError("Updater is not installed")
+    systemctl = shutil.which("systemctl") or "systemctl"
+    owner = run_command([systemctl, "show", "-p", "User", "--value", UPDATER]).stdout.strip()
+    if owner != pwd.getpwuid(os.geteuid()).pw_name:
+        raise RuntimeError("Updater service belongs to another account")
+    pid = run_command([systemctl, "show", "-p", "MainPID", "--value", UPDATER]).stdout.strip()
+    if not pid.isdigit() or int(pid) <= 0:
+        raise RuntimeError("Start the updater service before using --update")
+    payload, version = fetch_updater_source()
+    if path.read_bytes() == payload:
+        log(f"[SELF-UPDATE] Already current: {version}")
+        return
+    os.kill(int(pid), signal.SIGUSR2)
+    log(f"[SELF-UPDATE] Requested {version}; waiting for safe restart")
+    deadline = time.monotonic() + 120
+    while time.monotonic() < deadline:
+        if path.read_bytes() == payload:
+            time.sleep(2)
+            active = run_command([systemctl, "is-active", UPDATER], check=False).stdout.strip()
+            if active == "active":
+                log(f"[SELF-UPDATE] Installed {version}; service active")
+                return
+        time.sleep(2)
+    log("[SELF-UPDATE] Update queued until current operation finishes; see journalctl")
+
+
 def main():
     if sys.version_info < (3, 12):
         raise RuntimeError("Python 3.12 or newer is required")
     parser = argparse.ArgumentParser(description=__doc__)
     choice = parser.add_mutually_exclusive_group(required=True)
-    for name in ("install", "uninstall", "run", "status", "check-now", "version"):
+    for name in ("install", "uninstall", "run", "status", "check-now", "update", "version"):
         choice.add_argument("--" + name, action="store_true")
     parser.add_argument("--api-url", default="http://127.0.0.1:8090", help="Local Strata HTTP API")
     options = parser.parse_args()
@@ -759,6 +811,8 @@ def main():
         state = read_state()
         state["updater_service"] = run_command([shutil.which("systemctl") or "systemctl", "is-active", UPDATER], check=False).stdout.strip()
         print(json.dumps(state, indent=2, sort_keys=True))
+    elif options.update:
+        manual_self_update()
     elif options.check_now:
         systemctl = shutil.which("systemctl") or "systemctl"
         pid = run_command([systemctl, "show", "-p", "MainPID", "--value", UPDATER]).stdout.strip()
