@@ -51,80 +51,49 @@ Manual builds: **Actions → Strata CUDA 13.2 / sm_120 → Run workflow**.
 
 ## Automatic server updater
 
-The optional [single-file updater](strata-updater.py) runs continuously under `systemd` as **the Linux user who installs it** (not a hard-coded account). It checks this repository's releases every **12 hours**, verifies SHA-256, installs matching Engine and Web/API files, and retains the current and previous release directories. When Strata is running, it waits for the model to unload, checking every minute. After updating, it checks server startup and rolls back on failure. A previously stopped Strata service is started for verification and stopped again after cleanup.
+The optional [single-file `strata-updater.py`](strata-updater.py) is a persistent `systemd` service. Every **12 hours** it checks this repository for new Strata builds and changes to its **own script in `main`**. It verifies downloaded packages, waits for the model to unload, updates Engine and Web/API Server, tests startup, rolls back failures, and retains two installed release versions. An initially stopped Strata service is started for verification and stopped again after successful cleanup. Self-updates restart the updater process only, without restarting Strata.
 
-**Minimum requirements:** Linux with `systemd`, Python **3.12+**, `sudo`, `curl`, network access to GitHub, and sufficient free disk space for the download and temporary copies. Install as a regular user with sudo privileges **whose account is also configured as `User=` in the existing system `strata.service`**. Installation grants only narrowly scoped permission to start and stop `strata.service`; uninstall removes that permission.
-
-Before installation, the following **real, writable directories** must already exist under the installing user's home:
+**Minimum requirements:** Linux with `systemd`, Python **3.12+**, `sudo`, `curl`, access to GitHub, and sufficient free disk space. The non-root user installing the updater must be the same as `User=` in the existing system `strata.service`. Its home directory must already contain **real writable directories**:
 
 ```text
 ~/strata/
-├── strata-sm120/  # Active engine binaries and CUDA libraries
-└── server/        # Active Python API and Web interface
+├── strata-sm120/   # Active CUDA engine and libraries
+└── server/         # Active Python API and Web UI
 ```
 
-The existing `strata.service` must already start successfully with its working directory set to `~/strata/server`. Its model configuration should use `~/strata/strata-sm120/strata` for the engine, `~/strata/strata-sm120/strata-vision` for vision, and `~/strata/strata-sm120` for library lookup. Model data and external config files are not changed by the updater.
+The existing `strata.service` must use those stable paths for its engine, vision executable, CUDA libraries, and working directory. By default the local Strata API is at `http://127.0.0.1:8090`. Installation does not change Strata configuration or models.
 
-**Install with one command** (run as the Strata service user, **without** `sudo` in front):
+**Install in one command** as the Strata service user (do not prefix this command with `sudo`):
 
 ```bash
 tmp=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/SpyLive/Strata-CUDA-Builds/main/strata-updater.py -o "$tmp" && python3 "$tmp" --install; code=$?; rm -f "$tmp"; (exit "$code")
 ```
 
-**Uninstall with one command:**
+**Update the updater manually and restart it on the new version:**
+
+```bash
+python3 "$HOME/.local/bin/strata-updater.py" --update
+```
+
+With updater **v1.0.2 or newer**, this command requests an immediate self-update from the GitHub `main` branch. The running service applies it at a safe point and restarts its own Python process. **Automatic self-updates** are checked every 12 hours, including during long waits for model unloading. GitHub does not need inbound access to the server. A manual update requested while Strata files are being replaced is deferred until that operation is complete.
+
+**One-time upgrade from updater v1.0.1 (without `--update`):** repeat the install command above and then, when no Strata update is in progress, run `sudo systemctl restart strata-updater.service`. Future updater upgrades use `--update` directly.
+
+**Monitor progress, check status, or request a Strata-release check:**
+
+```bash
+journalctl -u strata-updater.service -f
+python3 "$HOME/.local/bin/strata-updater.py" --status
+python3 "$HOME/.local/bin/strata-updater.py" --check-now
+```
+
+**Uninstall in one command:**
 
 ```bash
 python3 "$HOME/.local/bin/strata-updater.py" --uninstall
 ```
 
-The uninstall command removes only the updater, its `systemd` unit and narrowly scoped service-control permission. It does not remove Strata, models, downloaded release folders or saved update status.
-
-Optional commands:
-
-```bash
-python3 "$HOME/.local/bin/strata-updater.py" --status
-python3 "$HOME/.local/bin/strata-updater.py" --check-now
-journalctl -u strata-updater.service -f
-```
-
-The default local API is `http://127.0.0.1:8090`. To use another port, pass `--api-url http://127.0.0.1:PORT` when installing. No separate updater configuration file is required.
-
-## Automatic updater (optional)
-
-The single-file `strata-updater.py` installs a persistent `strata-updater.service` for Linux hosts. It checks this repository every 12 hours, downloads and verifies new builds, waits for the model to unload, updates the Engine and Server, checks service startup, and retains the two most recent installed releases. Failed installations are rolled back.
-
-**Minimum requirements:** Linux with systemd and sudo; Python 3.12 or newer; an existing `strata.service` running as the installing non-root user; writable, real directories `~/strata/strata-sm120/` and `~/strata/server/`. The Strata service must use these stable locations for Engine and Server, and provide the local API at `http://127.0.0.1:8090` (configurable with `--api-url`). Model data and configuration are not managed by the updater.
-
-Install as the same ordinary user that runs `strata.service` (**do not prefix the whole command with `sudo`**):
-
-```bash
-tmp=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/SpyLive/Strata-CUDA-Builds/main/strata-updater.py -o "$tmp" && python3 "$tmp" --install; rm -f "$tmp"
-```
-
-Watch live stages and download progress (every 5%) in systemd's journal:
-
-```bash
-journalctl -u strata-updater.service -f
-```
-
-Show the state or request an immediate release check:
-
-```bash
-python3 ~/.local/bin/strata-updater.py --status
-python3 ~/.local/bin/strata-updater.py --check-now
-```
-
-To upgrade an already installed updater, repeat the install command above, **then restart the updater service when no installation is in progress**:
-
-```bash
-sudo systemctl restart strata-updater.service
-```
-
-Uninstall (leaves Strata files, models, and updater state untouched):
-
-```bash
-python3 ~/.local/bin/strata-updater.py --uninstall
-```
+Uninstall removes the updater service and its restricted `sudo` permission, leaving Strata binaries, release archives, models, and saved state intact.
 
 ## Compatibility and security
 
