@@ -53,7 +53,7 @@ Manual builds: **Actions → Strata CUDA 13.2 / sm_120 → Run workflow**.
 
 The optional [single-file updater](strata-updater.py) runs continuously under `systemd` as **the Linux user who installs it** (not a hard-coded account). It checks this repository's releases every **12 hours**, verifies SHA-256, installs matching Engine and Web/API files, and retains the current and previous release directories. When Strata is running, it waits for the model to unload, checking every minute. After updating, it checks server startup and rolls back on failure. A previously stopped Strata service is started for verification and stopped again after cleanup.
 
-**Minimum requirements:** Linux with `systemd`, Python **3.12+**, `sudo`, `curl`, network access to GitHub, and sufficient free disk space for the download and temporary copies. Install as a regular user with sudo privileges **whose account is also configured as `User=` in the existing system `strata.service`**. The updater temporarily receives permission only to start and stop `strata.service`.
+**Minimum requirements:** Linux with `systemd`, Python **3.12+**, `sudo`, `curl`, network access to GitHub, and sufficient free disk space for the download and temporary copies. Install as a regular user with sudo privileges **whose account is also configured as `User=` in the existing system `strata.service`**. Installation grants only narrowly scoped permission to start and stop `strata.service`; uninstall removes that permission.
 
 Before installation, the following **real, writable directories** must already exist under the installing user's home:
 
