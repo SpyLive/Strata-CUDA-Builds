@@ -6,6 +6,7 @@ scoped sudoers rule so the runtime process can control strata.service as its own
 """
 
 import argparse
+import base64
 import datetime as dt
 import hashlib
 import fcntl
@@ -26,7 +27,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 REPO = "SpyLive/Strata-CUDA-Builds"
 PREFIX = "strata-sm120-cuda13.2-"
 SERVICE = "strata.service"
@@ -37,10 +38,12 @@ HEALTH_TIMEOUT = 90
 MAX_ARCHIVE_BYTES = 2 * 1024**3
 MAX_EXTRACT_BYTES = 4 * 1024**3
 MAX_MEMBERS = 25000
+MAX_SELF_SOURCE_BYTES = 512 * 1024
 TAG_RE = re.compile(r"^strata-sm120-cuda13\.2-v(\d+\.\d+\.\d+(?:\.\d+)?)$")
 ENGINE_RE = re.compile(r"^strata-v(\d+)-sm120$")
 SERVER_RE = re.compile(r"^server-v(\d+)$")
 WAKE = threading.Event()
+SELF_UPDATE_REQUESTED = threading.Event()
 
 
 def log(message):
@@ -103,6 +106,70 @@ def control(systemctl, verb):
 def request(url, timeout=25):
     headers = {"User-Agent": f"strata-updater/{VERSION}", "Accept": "application/vnd.github+json"}
     return urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=timeout)
+
+
+
+def fetch_updater_source():
+    """Retrieve updater source from GitHub main with its Git blob checksum."""
+    url = f"https://api.github.com/repos/{REPO}/contents/strata-updater.py?ref=main"
+    with request(url, timeout=35) as response:
+        info = json.loads(response.read(MAX_SELF_SOURCE_BYTES * 2))
+    encoded = info.get("content")
+    if info.get("encoding") != "base64" or not isinstance(encoded, str):
+        raise RuntimeError("Unexpected GitHub source response")
+    payload = base64.b64decode("".join(encoded.split()), validate=True)
+    if not payload or len(payload) > MAX_SELF_SOURCE_BYTES:
+        raise RuntimeError("Updater source empty or too large")
+    blob_sha = hashlib.sha1(b"blob " + str(len(payload)).encode("ascii") + b"\0" + payload).hexdigest()
+    if blob_sha != info.get("sha"):
+        raise RuntimeError("Updater source checksum does not match GitHub metadata")
+    code = payload.decode("utf-8")
+    if not code.startswith("#!/usr/bin/env python3"):
+        raise RuntimeError("Invalid updater source header")
+    compile(code, "strata-updater.py", "exec")
+    match = re.search(r'^VERSION = "(\d+\.\d+\.\d+)"$', code, re.MULTILINE)
+    if not match:
+        raise RuntimeError("Downloaded updater does not declare its version")
+    version = match.group(1)
+    if tuple(map(int, version.split("."))) < tuple(map(int, VERSION.split("."))):
+        raise RuntimeError("Refusing updater downgrade")
+    return payload, version
+
+
+def write_updater_atomically(path, payload, version):
+    fd, name = tempfile.mkstemp(prefix=".strata-updater-upgrade-", dir=path.parent)
+    staging = Path(name)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        staging.chmod(0o755)
+        check = run_command([sys.executable, str(staging), "--version"], timeout=20)
+        if check.stdout.strip() != version:
+            raise RuntimeError("New updater failed startup test")
+        os.replace(staging, path)
+    finally:
+        staging.unlink(missing_ok=True)
+
+
+def perform_self_update(api_url):
+    """At a safe point replace the script and exec into it, preserving systemd MainPID."""
+    path = home() / ".local/bin/strata-updater.py"
+    if not path.is_file() or path.resolve() != Path(__file__).resolve():
+        raise RuntimeError("Self-update requires the installed updater")
+    payload, version = fetch_updater_source()
+    previous = path.read_bytes()
+    if payload == previous:
+        return False
+    log(f"[SELF-UPDATE] New version in GitHub: {VERSION} -> {version}")
+    write_updater_atomically(path, payload, version)
+    log(f"[SELF-UPDATE] Installed {version}; restarting updater process")
+    try:
+        os.execv(sys.executable, [sys.executable, str(path), "--run", "--api-url", api_url])
+    except OSError as exc:
+        write_updater_atomically(path, previous, VERSION)
+        raise RuntimeError(f"Failed restarting updater; restored previous version: {exc}") from exc
 
 
 def releases():
