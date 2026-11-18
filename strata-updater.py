@@ -26,7 +26,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 REPO = "SpyLive/Strata-CUDA-Builds"
 PREFIX = "strata-sm120-cuda13.2-"
 SERVICE = "strata.service"
@@ -168,6 +168,11 @@ def download_archive(asset, root, sha256):
     try:
         hashed = hashlib.sha256()
         count = 0
+        total = asset.get("size")
+        if not isinstance(total, int) or total <= 0:
+            raise RuntimeError("Release asset has no valid size")
+        next_percent = 5
+        log(f"[DOWNLOAD] 0% (0.0 / {total / 1024**2:.1f} MiB)")
         with request(asset["browser_download_url"], timeout=60) as response, partial.open("wb") as stream:
             while True:
                 block = response.read(1024 * 1024)
@@ -178,10 +183,15 @@ def download_archive(asset, root, sha256):
                     raise RuntimeError("Archive exceeds configured size limit")
                 hashed.update(block)
                 stream.write(block)
-        if count != asset.get("size"):
+                while next_percent <= 95 and count * 100 >= next_percent * total:
+                    log(f"[DOWNLOAD] {next_percent}% ({count / 1024**2:.1f} / {total / 1024**2:.1f} MiB)")
+                    next_percent += 5
+        if count != total:
             raise RuntimeError("Downloaded archive size does not match release metadata")
         if hashed.hexdigest() != sha256 or hashed.hexdigest() != asset_digest(asset):
             raise RuntimeError("Downloaded archive failed SHA-256 verification")
+        log(f"[DOWNLOAD] 100% ({count / 1024**2:.1f} / {total / 1024**2:.1f} MiB)")
+        log("[VERIFY] Archive SHA-256 OK")
         os.replace(partial, path)
         return path
     finally:
@@ -269,18 +279,26 @@ def can_stop(base):
 
 
 def wait_for_idle(systemctl, base):
+    last_report = -float("inf")
     while True:
         active = service_state(systemctl)
         if active == "inactive":
+            log("[WAIT] Strata is stopped; a temporary verification start will follow installation")
             return False
         if active == "active":
             try:
                 if can_stop(base):
+                    log("[WAIT] Model unloaded and no requests in flight")
                     return True
+                message = "Model loaded or requests pending; waiting for automatic unload"
             except (ValueError, OSError, KeyError, RuntimeError) as exc:
-                log(f"Status unavailable; leaving Strata untouched: {exc}")
+                message = f"Strata status unavailable; waiting without stopping service: {exc}"
         else:
-            log(f"Waiting for stable Strata service state: {active}")
+            message = f"Waiting for stable Strata service state: {active}"
+        now = time.monotonic()
+        if now - last_report >= 5 * 60:
+            log(f"[WAIT] {message}; checking every {POLL}s")
+            last_report = now
         time.sleep(POLL)
 
 
@@ -298,6 +316,7 @@ def confirm_started(systemctl, base):
                         status.get("service") == "strata" and isinstance(status.get("loaded"), bool):
                     good += 1
                     if good >= 2:
+                        log("[HEALTH] Strata service and HTTP API OK")
                         return
                 else:
                     good = 0
@@ -353,6 +372,7 @@ def finalize_committed(root, state, systemctl):
     if not tx or tx.get("phase") != "committed":
         return
     backup = temp_backup(root)
+    log("[CLEANUP] Removing temporary backups and obsolete release directories")
     if backup.exists():
         shutil.rmtree(backup)
     retain_two(root, state["current_tag"], state.get("previous_dirs"))
@@ -364,6 +384,7 @@ def finalize_committed(root, state, systemctl):
             raise RuntimeError("Verification service did not return to the stopped state")
     state.pop("transaction", None)
     save_state(state)
+    log("[CLEANUP] Complete; current and previous release retained")
 
 
 def restore_transaction(root, state, systemctl):
@@ -373,7 +394,7 @@ def restore_transaction(root, state, systemctl):
     if tx.get("phase") == "committed":
         finalize_committed(root, state, systemctl)
         return
-    log("Recovering interrupted installation")
+    log("[ROLLBACK] Recovering interrupted installation")
     backup = temp_backup(root)
     original_active = bool(tx.get("original_active"))
     if backup.exists() and any((backup / name).exists() for name in ("engine", "server")):
@@ -395,7 +416,7 @@ def restore_transaction(root, state, systemctl):
         shutil.rmtree(root / name, ignore_errors=True)
     state.pop("transaction", None)
     save_state(state)
-    log("Previous working directories restored")
+    log("[ROLLBACK] Previous working directories restored")
 
 
 def install_release(root, state, tag, digest, systemctl, api_url):
@@ -414,9 +435,13 @@ def install_release(root, state, tag, digest, systemctl, api_url):
     save_state(state)
     try:
         if original_active:
+            log("[UPDATE] Stopping Strata")
             control(systemctl, "stop")
+        else:
+            log("[UPDATE] Strata was stopped; retaining its original stopped state")
         if service_state(systemctl) != "inactive":
             raise RuntimeError("Strata did not stop cleanly")
+        log(f"[INSTALL] Installing {tag}: Engine and Server")
         backup.mkdir(mode=0o700)
         staged_engine = root / ".strata-updater-new-engine"
         staged_server = root / ".strata-updater-new-server"
@@ -430,6 +455,7 @@ def install_release(root, state, tag, digest, systemctl, api_url):
         os.replace(originals[1], backup / "server")
         os.replace(staged_engine, originals[0])
         os.replace(staged_server, originals[1])
+        log("[START] Starting Strata for verification")
         control(systemctl, "start")
         confirm_started(systemctl, api_url)
         state.update(current_tag=tag, current_sha256=digest, previous_tag=previous_tag,
@@ -444,13 +470,16 @@ def install_release(root, state, tag, digest, systemctl, api_url):
         try:
             finalize_committed(root, state, systemctl)
         except Exception as exc:
-            log(f"New version installed, cleanup pending: {exc}")
+            log(f"[CLEANUP] Installed new version, cleanup pending: {exc}")
             if not original_active:
                 try:
                     control(systemctl, "stop")
                 except Exception as stop_error:
-                    log(f"Unable to restore the stopped state yet: {stop_error}")
-        log(f"Installed {tag}; original service state was {'running' if original_active else 'stopped'}")
+                    log(f"[CLEANUP] Unable to restore the stopped state yet: {stop_error}")
+        if state.get("transaction"):
+            log(f"[UPDATE] Installed {tag}; cleanup pending")
+        else:
+            log(f"[DONE] Updated to {tag}; Strata {'running' if original_active else 'stopped'}")
     except Exception:
         try:
             restore_transaction(root, state, systemctl)
@@ -464,7 +493,7 @@ def install_candidate(root, state, release, archive, checksums, systemctl, api_u
     tag = release["tag_name"]
     archive_sha = asset_digest(archive)
     if state.get("current_tag") == tag and state.get("current_sha256") == archive_sha:
-        log(f"Already installed: {tag}")
+        log(f"[SKIP] Already installed: {tag}")
         return
     existing = TAG_RE.fullmatch(state.get("current_tag") or "")
     incoming = TAG_RE.fullmatch(tag)
@@ -472,11 +501,12 @@ def install_candidate(root, state, release, archive, checksums, systemctl, api_u
         old_v = tuple(map(int, existing.group(1).split(".")))
         new_v = tuple(map(int, incoming.group(1).split(".")))
         if new_v < old_v:
-            log(f"Refusing automatic downgrade from {state['current_tag']} to {tag}")
+            log(f"[SKIP] Refusing automatic downgrade from {state['current_tag']} to {tag}")
             return
     if state.get("failed_digest") == archive_sha:
-        log(f"Skipping previously failed package: {tag}; awaiting a different release")
+        log(f"[SKIP] Previously failed package: {tag}; awaiting a different release")
         return
+    log(f"[FOUND] New compatible package: {tag}")
     engine_name, server_name = version_dirs(tag)
     pending = state.get("pending")
     if not (isinstance(pending, dict) and pending.get("tag") == tag and
@@ -486,17 +516,20 @@ def install_candidate(root, state, release, archive, checksums, systemctl, api_u
         checked_sha = expected_checksum(text, archive["name"])
         if checked_sha != archive_sha:
             raise RuntimeError("SHA256SUMS.txt and GitHub asset digest disagree")
-        log(f"Downloading {archive['name']}")
+        log(f"[DOWNLOAD] Downloading {archive['name']}")
         file = download_archive(archive, root, checked_sha)
         try:
+            log("[EXTRACT] Extracting Engine and Server")
             extract_archive(file, root, tag)
+            log("[EXTRACT] Engine and Server ready")
         finally:
             file.unlink(missing_ok=True)
         state["pending"] = {"tag": tag, "sha256": archive_sha}
         save_state(state)
     else:
         validate_component_paths(root / engine_name, root / server_name)
-    log(f"Prepared {tag}; monitoring Strata until safe to install")
+        log("[EXTRACT] Reusing previously prepared Engine and Server")
+    log(f"[WAIT] Prepared {tag}; monitoring Strata until safe to install")
     try:
         install_release(root, state, tag, archive_sha, systemctl, api_url)
     except Exception as exc:
@@ -526,16 +559,17 @@ def run_daemon(root, api_url):
     def wake(signum, frame):
         WAKE.set()
     signal.signal(signal.SIGUSR1, wake)
-    log(f"Updater {VERSION} started; release checks every 12 hours")
+    log(f"[START] Updater {VERSION} started; release checks every 12 hours")
     while True:
         try:
             restore_transaction(root, state, systemctl)
+            log("[CHECK] Checking GitHub releases")
             _, release, archive, checksums = releases()
             state["last_checked_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
             save_state(state)
             install_candidate(root, state, release, archive, checksums, systemctl, api_url)
         except Exception as exc:
-            log(f"Update check failed: {exc}")
+            log(f"[ERROR] Update check failed: {exc}")
         WAKE.wait(INTERVAL)
         WAKE.clear()
 
