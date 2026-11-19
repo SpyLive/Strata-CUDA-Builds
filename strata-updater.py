@@ -27,7 +27,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.0.3"
+VERSION = "1.1.0"
 REPO = "SpyLive/Strata-CUDA-Builds"
 PREFIX = "strata-sm120-cuda13.2-"
 SERVICE = "strata.service"
@@ -42,6 +42,10 @@ MAX_SELF_SOURCE_BYTES = 512 * 1024
 TAG_RE = re.compile(r"^strata-sm120-cuda13\.2-v(\d+\.\d+\.\d+(?:\.\d+)?)$")
 ENGINE_RE = re.compile(r"^strata-v(\d+)-sm120$")
 SERVER_RE = re.compile(r"^server-v(\d+)$")
+CUDA_ARCHIVE = "strata-cuda-libs-cuda13.2-linux-x86_64.tar.gz"
+CUDA_JSON = "CUDA-LIBS.json"
+CUDA_LIBS = ("libcublasLt.so.13", "libcublas.so.13", "libcudart.so.13")
+MAX_CUDA_JSON = 16384
 WAKE = threading.Event()
 SELF_UPDATE_REQUESTED = threading.Event()
 
@@ -172,11 +176,12 @@ def perform_self_update(api_url):
         raise RuntimeError(f"Failed restarting updater; restored previous version: {exc}") from exc
 
 
+
 def releases():
     url = f"https://api.github.com/repos/{REPO}/releases?per_page=100"
     with request(url) as response:
         data = json.load(response)
-    options = []
+    candidates = []
     for release in data:
         if not isinstance(release, dict) or release.get("draft"):
             continue
@@ -185,17 +190,17 @@ def releases():
         if not match:
             continue
         version = tuple(map(int, match.group(1).split(".")))
-        upstream = tag[len(PREFIX):]
-        expected = f"strata-engine-{upstream}-cuda13.2-sm120-linux-x86_64.tar.gz"
-        by_name = {a.get("name"): a for a in release.get("assets", [])}
-        archive = by_name.get(expected)
-        checksums = by_name.get("SHA256SUMS.txt")
-        if archive and checksums and archive.get("browser_download_url") and checksums.get("browser_download_url"):
-            options.append((version, release, archive, checksums))
-    if not options:
-        raise RuntimeError("No compatible releases with archive and checksums")
-    return max(options, key=lambda item: item[0])
-
+        if version < (0, 2, 14):
+            continue
+        core_name = f"strata-engine-{tag[len(PREFIX):]}-cuda13.2-sm120-linux-x86_64.tar.gz"
+        assets = {a.get("name"): a for a in release.get("assets", []) if isinstance(a, dict)}
+        core, cuda = assets.get(core_name), assets.get(CUDA_ARCHIVE)
+        meta, checks = assets.get(CUDA_JSON), assets.get("SHA256SUMS.txt")
+        if all(a and a.get("browser_download_url") for a in (core, cuda, meta, checks)):
+            candidates.append((version, release, core, cuda, meta, checks))
+    if not candidates:
+        raise RuntimeError("No compatible release with two archives, CUDA-LIBS.json and SHA256SUMS.txt")
+    return max(candidates, key=lambda x: x[0])
 
 def asset_digest(asset):
     digest = asset.get("digest", "")
@@ -225,6 +230,137 @@ def expected_checksum(text, filename):
     if result is None:
         raise RuntimeError("Archive not listed in SHA256SUMS.txt")
     return result
+
+
+def cuda_json_bytes(info):
+    return (json.dumps(info, sort_keys=True, indent=2) + "\n").encode("utf-8")
+
+
+def validate_cuda_json(payload):
+    try:
+        info = json.loads(payload)
+    except (UnicodeError, ValueError) as exc:
+        raise RuntimeError(f"Invalid CUDA-LIBS.json: {exc}") from exc
+    if (not isinstance(info, dict) or set(info) != {"schema_version", "cuda", "libraries"}
+            or info["schema_version"] != 1 or info["cuda"] != "13.2"):
+        raise RuntimeError("Unexpected CUDA-LIBS.json schema")
+    entries = info["libraries"]
+    if not isinstance(entries, dict) or set(entries) != set(CUDA_LIBS):
+        raise RuntimeError("CUDA-LIBS.json must contain exactly three libraries")
+    for name in CUDA_LIBS:
+        entry = entries[name]
+        if (not isinstance(entry, dict) or set(entry) != {"sha256", "size"}
+                or not isinstance(entry["sha256"], str)
+                or not re.fullmatch(r"[0-9a-f]{64}", entry["sha256"])
+                or type(entry["size"]) is not int or entry["size"] <= 0):
+            raise RuntimeError(f"Invalid CUDA library record: {name}")
+    if cuda_json_bytes(info) != payload:
+        raise RuntimeError("Noncanonical CUDA-LIBS.json")
+    return info
+
+
+def read_cuda_asset(asset, checks):
+    expected = expected_checksum(checks, CUDA_JSON)
+    if expected != asset_digest(asset):
+        raise RuntimeError("CUDA-LIBS.json checksum disagrees with GitHub digest")
+    with request(asset["browser_download_url"], timeout=45) as response:
+        payload = response.read(MAX_CUDA_JSON + 1)
+    if len(payload) > MAX_CUDA_JSON or hashlib.sha256(payload).hexdigest() != expected:
+        raise RuntimeError("CUDA-LIBS.json download failed verification")
+    return payload, validate_cuda_json(payload)
+
+
+def local_cuda_manifest(root):
+    """Trust installed JSON; compute local library hashes only if JSON is missing."""
+    folder = root / "libs"
+    if not folder.is_dir() or folder.is_symlink():
+        return None
+    manifest = folder / CUDA_JSON
+    if manifest.is_symlink():
+        raise RuntimeError("Refusing local CUDA-LIBS.json symlink")
+    if manifest.exists():
+        if not manifest.is_file():
+            raise RuntimeError("Local CUDA-LIBS.json is not a file")
+        log("[LIBS] Existing CUDA-LIBS.json found; no local library hash check")
+        return manifest.read_bytes()
+    entries = {}
+    for name in CUDA_LIBS:
+        file = folder / name
+        if not file.is_file() or file.is_symlink():
+            return None
+        digest = hashlib.sha256()
+        with file.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        entries[name] = {"sha256": digest.hexdigest(), "size": file.stat().st_size}
+    content = cuda_json_bytes({"schema_version": 1, "cuda": "13.2", "libraries": entries})
+    fd, path = tempfile.mkstemp(prefix=".cuda-meta-", dir=folder)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(path, 0o600)
+        os.replace(path, manifest)
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+    log("[LIBS] Created local CUDA-LIBS.json with one-time SHA-256 values")
+    return content
+
+
+def same_cuda_libraries(root, published):
+    if local_cuda_manifest(root) != published:
+        return False
+    folder = root / "libs"
+    return all((folder / name).is_file() and not (folder / name).is_symlink()
+               for name in CUDA_LIBS)
+
+
+def stage_cuda_archive(archive, root, published, parsed):
+    """Unpack and hash only newly downloaded CUDA libraries."""
+    target = root / ".strata-updater-new-libs"
+    if target.is_symlink():
+        raise RuntimeError("Refusing symlink in CUDA staging directory")
+    if target.exists():
+        shutil.rmtree(target)
+    temp = Path(tempfile.mkdtemp(prefix=".cuda-unpack-", dir=root))
+    try:
+        with tarfile.open(archive, "r:gz") as tar:
+            members = tar.getmembers()
+            names = [m.name for m in members]
+            expected = {"libs/" + n for n in (*CUDA_LIBS, CUDA_JSON)}
+            if (len(members) > MAX_MEMBERS or len(set(names)) != len(names)
+                    or {m.name for m in members if m.isfile()} != expected):
+                raise RuntimeError("Invalid CUDA archive entries")
+            size = 0
+            for m in members:
+                p = PurePosixPath(m.name)
+                if (not p.parts or p.parts[0] != "libs" or p.is_absolute()
+                        or ".." in p.parts or not (m.isfile() or m.isdir())):
+                    raise RuntimeError(f"Unsafe CUDA archive member: {m.name}")
+                size += m.size
+                if size > MAX_EXTRACT_BYTES:
+                    raise RuntimeError("CUDA archive exceeds extraction limit")
+            tar.extractall(path=temp, members=members, filter="data")
+        folder = temp / "libs"
+        if (folder / CUDA_JSON).read_bytes() != published:
+            raise RuntimeError("Embedded CUDA-LIBS.json does not match published file")
+        for name in CUDA_LIBS:
+            file = folder / name
+            if not file.is_file() or file.is_symlink():
+                raise RuntimeError(f"Missing CUDA library: {name}")
+            digest = hashlib.sha256()
+            with file.open("rb") as stream:
+                for block in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(block)
+            recorded = parsed["libraries"][name]
+            if file.stat().st_size != recorded["size"] or digest.hexdigest() != recorded["sha256"]:
+                raise RuntimeError(f"Downloaded CUDA library hash mismatch: {name}")
+        os.replace(folder, target)
+        log("[LIBS] Downloaded CUDA libraries verified and staged")
+    finally:
+        shutil.rmtree(temp, ignore_errors=True)
 
 
 def download_archive(asset, root, sha256):
@@ -275,11 +411,13 @@ def version_dirs(tag):
 
 def validate_component_paths(engine, server):
     for path in (engine / "strata", engine / "strata-vision", engine / "BUILD.json", engine / "engine-component.json",
-                 engine / "libcudart.so.13", engine / "libcublas.so.13", engine / "libcublasLt.so.13",
                  server / "serve/server.py", server / "serve/web/index.html", server / "serve/web/app.js",
                  server / "requirements.txt", server / "strata.py", server / "SOURCE-SHA.txt"):
         if not path.is_file() or path.is_symlink():
             raise RuntimeError(f"Missing or invalid release file: {path}")
+    for name in CUDA_LIBS:
+        if (engine / name).exists():
+            raise RuntimeError(f"CUDA library unexpectedly included in Engine: {name}")
     for path in (engine / "strata", engine / "strata-vision"):
         if not os.access(path, os.X_OK):
             raise RuntimeError(f"Binary is not executable: {path}")
@@ -477,41 +615,59 @@ def restore_transaction(root, state, systemctl):
     log("[ROLLBACK] Recovering interrupted installation")
     backup = temp_backup(root)
     original_active = bool(tx.get("original_active"))
-    if backup.exists() and any((backup / name).exists() for name in ("engine", "server")):
+    if backup.exists() and any((backup / name).exists() for name in ("engine", "server", "libs")):
         control(systemctl, "stop")
-        for name, dest_name in (("engine", "strata-sm120"), ("server", "server")):
-            saved = backup / name
-            dest = root / dest_name
+        for name, dest_name in (("engine", "strata-sm120"), ("server", "server"), ("libs", "libs")):
+            saved, dest = backup / name, root / dest_name
             if saved.exists():
+                if dest.is_symlink():
+                    raise RuntimeError(f"Refusing symlink during rollback: {dest}")
                 if dest.exists():
                     shutil.rmtree(dest)
                 os.replace(saved, dest)
+        if tx.get("libs_changed") and not tx.get("libs_present"):
+            libdir = root / "libs"
+            if libdir.is_symlink():
+                raise RuntimeError("Refusing symlink during CUDA rollback")
+            if libdir.exists():
+                shutil.rmtree(libdir)
     if original_active:
         control(systemctl, "start")
     elif service_state(systemctl) != "inactive":
         control(systemctl, "stop")
     if backup.exists():
         shutil.rmtree(backup)
-    for name in (".strata-updater-new-engine", ".strata-updater-new-server"):
+    for name in (".strata-updater-new-engine", ".strata-updater-new-server",
+                 ".strata-updater-new-libs"):
         shutil.rmtree(root / name, ignore_errors=True)
     state.pop("transaction", None)
     save_state(state)
     log("[ROLLBACK] Previous working directories restored")
 
 
-def install_release(root, state, tag, digest, systemctl, api_url):
+def install_release(root, state, tag, digest, systemctl, api_url, cuda_json_sha, replace_libs):
     engine_name, server_name = version_dirs(tag)
     originals = (root / "strata-sm120", root / "server")
     sources = (root / engine_name, root / server_name)
     validate_component_paths(*sources)
     if not all(x.is_dir() and not x.is_symlink() for x in originals):
         raise RuntimeError("Both working directories must exist as real directories")
+    libs = root / "libs"
+    staged_libs = root / ".strata-updater-new-libs"
+    if libs.is_symlink():
+        raise RuntimeError("CUDA library directory cannot be a symlink")
+    if replace_libs:
+        if not staged_libs.is_dir() or staged_libs.is_symlink():
+            raise RuntimeError("Verified CUDA staging directory is missing")
+    elif not libs.is_dir() or any(not (libs / n).is_file() for n in CUDA_LIBS):
+        raise RuntimeError("Installed CUDA libraries are missing")
     original_active = wait_for_idle(systemctl, api_url)
     backup = temp_backup(root)
     if backup.exists():
         raise RuntimeError("Unresolved backup directory; refusing update")
     previous_tag, previous_dirs = selected_previous(root, state, tag)
-    state["transaction"] = {"phase": "prepared", "original_active": original_active, "tag": tag}
+    state["transaction"] = {"phase": "prepared", "original_active": original_active, "tag": tag,
+                            "libs_changed": replace_libs, "libs_present": libs.is_dir()}
     save_state(state)
     try:
         if original_active:
@@ -535,10 +691,18 @@ def install_release(root, state, tag, digest, systemctl, api_url):
         os.replace(originals[1], backup / "server")
         os.replace(staged_engine, originals[0])
         os.replace(staged_server, originals[1])
+        if replace_libs:
+            if libs.exists():
+                os.replace(libs, backup / "libs")
+            os.replace(staged_libs, libs)
+            log("[LIBS] Installed verified CUDA libraries; saved previous library set")
+        else:
+            log("[LIBS] Retaining existing CUDA libraries")
         log("[START] Starting Strata for verification")
         control(systemctl, "start")
         confirm_started(systemctl, api_url)
-        state.update(current_tag=tag, current_sha256=digest, previous_tag=previous_tag,
+        state.update(current_tag=tag, current_sha256=digest, cuda_json_sha256=cuda_json_sha,
+                     previous_tag=previous_tag,
                      previous_dirs=list(previous_dirs) if previous_dirs else None,
                      installed_at=dt.datetime.now(dt.timezone.utc).isoformat())
         state.pop("pending", None)
@@ -564,61 +728,80 @@ def install_release(root, state, tag, digest, systemctl, api_url):
         try:
             restore_transaction(root, state, systemctl)
         finally:
-            for name in (".strata-updater-new-engine", ".strata-updater-new-server"):
+            for name in (".strata-updater-new-engine", ".strata-updater-new-server",
+                         ".strata-updater-new-libs"):
                 shutil.rmtree(root / name, ignore_errors=True)
         raise
 
 
-def install_candidate(root, state, release, archive, checksums, systemctl, api_url):
+
+def install_candidate(root, state, release, archive, cuda_archive, cuda_meta, checksums, systemctl, api_url):
     tag = release["tag_name"]
-    archive_sha = asset_digest(archive)
-    if state.get("current_tag") == tag and state.get("current_sha256") == archive_sha:
+    core_sha = asset_digest(archive)
+    if state.get("current_tag") == tag and state.get("current_sha256") == core_sha:
         log(f"[SKIP] Already installed: {tag}")
         return
-    existing = TAG_RE.fullmatch(state.get("current_tag") or "")
-    incoming = TAG_RE.fullmatch(tag)
-    if existing and incoming:
-        old_v = tuple(map(int, existing.group(1).split(".")))
-        new_v = tuple(map(int, incoming.group(1).split(".")))
-        if new_v < old_v:
-            log(f"[SKIP] Refusing automatic downgrade from {state['current_tag']} to {tag}")
+    old, new = TAG_RE.fullmatch(state.get("current_tag") or ""), TAG_RE.fullmatch(tag)
+    if old and new:
+        if tuple(map(int, new.group(1).split("."))) < tuple(map(int, old.group(1).split("."))):
+            log(f"[SKIP] Refusing automatic downgrade to {tag}")
             return
-    if state.get("failed_digest") == archive_sha:
-        log(f"[SKIP] Previously failed package: {tag}; awaiting a different release")
+    if state.get("failed_digest") == core_sha:
+        log(f"[SKIP] Previously failed package: {tag}")
         return
-    log(f"[FOUND] New compatible package: {tag}")
+
+    checks = read_checksums(checksums)
+    if expected_checksum(checks, archive["name"]) != core_sha:
+        raise RuntimeError("Engine archive SHA-256 disagrees with checksum list")
+    cuda_sha = asset_digest(cuda_archive)
+    if expected_checksum(checks, cuda_archive["name"]) != cuda_sha:
+        raise RuntimeError("CUDA archive SHA-256 disagrees with checksum list")
+    published, parsed = read_cuda_asset(cuda_meta, checks)
+    update_libs = not same_cuda_libraries(root, published)
+    if update_libs:
+        log("[LIBS] CUDA-LIBS.json differs: separate CUDA archive required")
+    else:
+        log("[LIBS] CUDA-LIBS.json matches: no library download or rehash")
+
     engine_name, server_name = version_dirs(tag)
     pending = state.get("pending")
-    if not (isinstance(pending, dict) and pending.get("tag") == tag and
-            pending.get("sha256") == archive_sha and
-            (root / engine_name).is_dir() and (root / server_name).is_dir()):
-        text = read_checksums(checksums)
-        checked_sha = expected_checksum(text, archive["name"])
-        if checked_sha != archive_sha:
-            raise RuntimeError("SHA256SUMS.txt and GitHub asset digest disagree")
+    reuse = (isinstance(pending, dict) and pending.get("tag") == tag
+             and pending.get("sha256") == core_sha
+             and (root / engine_name).is_dir() and (root / server_name).is_dir())
+    if not reuse:
         log(f"[DOWNLOAD] Downloading {archive['name']}")
-        file = download_archive(archive, root, checked_sha)
+        downloaded = download_archive(archive, root, core_sha)
         try:
-            log("[EXTRACT] Extracting Engine and Server")
-            extract_archive(file, root, tag)
-            log("[EXTRACT] Engine and Server ready")
+            extract_archive(downloaded, root, tag)
         finally:
-            file.unlink(missing_ok=True)
-        state["pending"] = {"tag": tag, "sha256": archive_sha}
+            downloaded.unlink(missing_ok=True)
+        state["pending"] = {"tag": tag, "sha256": core_sha}
         save_state(state)
     else:
         validate_component_paths(root / engine_name, root / server_name)
-        log("[EXTRACT] Reusing previously prepared Engine and Server")
+        log("[EXTRACT] Reusing verified Engine and Server")
+    if update_libs:
+        log(f"[DOWNLOAD] Downloading {cuda_archive['name']}")
+        downloaded = download_archive(cuda_archive, root, cuda_sha)
+        try:
+            stage_cuda_archive(downloaded, root, published, parsed)
+        finally:
+            downloaded.unlink(missing_ok=True)
+    else:
+        stage = root / ".strata-updater-new-libs"
+        if stage.is_symlink():
+            raise RuntimeError("Refusing CUDA staging symlink")
+        if stage.exists():
+            shutil.rmtree(stage)
     log(f"[WAIT] Prepared {tag}; monitoring Strata until safe to install")
     try:
-        install_release(root, state, tag, archive_sha, systemctl, api_url)
+        install_release(root, state, tag, core_sha, systemctl, api_url,
+                        hashlib.sha256(published).hexdigest(), update_libs)
     except Exception as exc:
-        # Never permanently retry a broken build each minute or each scheduled check.
-        state["failed_digest"] = archive_sha
+        state["failed_digest"] = core_sha
         state.pop("pending", None)
         save_state(state)
         raise RuntimeError(f"Installation failed; rollback attempted: {exc}") from exc
-
 
 def run_daemon(root, api_url):
     systemctl = shutil.which("systemctl")
@@ -655,10 +838,11 @@ def run_daemon(root, api_url):
             except Exception as exc:
                 log(f"[SELF-UPDATE] Check failed: {exc}")
             log("[CHECK] Checking GitHub releases")
-            _, release, archive, checksums = releases()
+            _, release, archive, cuda_archive, cuda_meta, checksums = releases()
             state["last_checked_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
             save_state(state)
-            install_candidate(root, state, release, archive, checksums, systemctl, api_url)
+            install_candidate(root, state, release, archive, cuda_archive, cuda_meta,
+                              checksums, systemctl, api_url)
         except Exception as exc:
             log(f"[ERROR] Update check failed: {exc}")
         WAKE.wait(INTERVAL)
