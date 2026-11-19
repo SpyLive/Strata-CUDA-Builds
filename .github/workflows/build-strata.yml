@@ -215,6 +215,7 @@ jobs:
           server_dir="server-v$compact_version"
           bundle_root="$RUNNER_TEMP/strata-unified-release"
           mkdir -p "$bundle_root/$engine_dir" "$bundle_root/$server_dir" "$bundle_root/libs"
+          mkdir -p dist
           cp -a "$package/." "$bundle_root/$engine_dir/"
 
           # Include the matching Web/API server from the exact upstream tag.
@@ -260,7 +261,6 @@ jobs:
           python3 strata/packaging/package_engine.py --verify "$bundle_root/$engine_dir"
 
           archive="strata-engine-$UPSTREAM_TAG-cuda13.2-sm120-linux-x86_64.tar.gz"
-          mkdir -p dist
           tar -czf "dist/$archive" -C "$bundle_root" "$engine_dir" "$server_dir"
           cuda_archive="strata-cuda-libs-cuda13.2-linux-x86_64.tar.gz"
           tar -czf "dist/$cuda_archive" -C "$bundle_root" libs
