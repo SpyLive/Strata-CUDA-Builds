@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       upstream_tag:
-        description: "Upstream Strata release (blank = latest stable, e.g. v0.2.15)"
+        description: "Upstream Strata release (blank = latest stable, e.g. v0.2.16)"
         required: false
         type: string
       rebuild_existing:
@@ -50,6 +50,12 @@ jobs:
             exit 1
           fi
           gh api "repos/Niko1221/Strata/releases/tags/$tag" >/dev/null
+          python3 - "$tag" <<'PY'
+          import re, sys
+          m = re.match(r"^v(\d+)\.(\d+)\.(\d+)(?:\.|-|$)", sys.argv[1])
+          if not m or tuple(map(int, m.groups())) < (0, 2, 14):
+              raise SystemExit("Only v0.2.14 and newer Strata releases are supported")
+          PY
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "release_tag=$RELEASE_PREFIX$tag" >> "$GITHUB_OUTPUT"
 
@@ -82,6 +88,37 @@ jobs:
           path: strata
           persist-credentials: false
 
+      - name: Detect upstream source layout
+        if: steps.existing.outputs.published != 'true' || inputs.rebuild_existing == true
+        working-directory: strata
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f tools/packaging/build_cuda_linux.sh && -f engine/CMakeLists.txt && -f terminal/requirements.txt && -d terminal/serve && -d terminal/strata_control && -d terminal/tools ]]; then
+            recipe=tools/packaging/build_cuda_linux.sh
+            packager=tools/packaging/package_engine.py
+            requirements=terminal/requirements.txt
+            build_requirements=terminal/requirements-build.txt
+            server_root=terminal
+          elif [[ -f packaging/build_cuda_linux.sh && -f CMakeLists.txt && -f requirements.txt && -d serve && -d strata_control && -d tools ]]; then
+            recipe=packaging/build_cuda_linux.sh
+            packager=packaging/package_engine.py
+            requirements=requirements.txt
+            build_requirements=
+            server_root=.
+          else
+            echo "::error::Unrecognized upstream layout; refusing to build"
+            exit 1
+          fi
+          test -f "$packager"
+          {
+            echo "STRATA_BUILD_SCRIPT=$recipe"
+            echo "STRATA_PACKAGER=$packager"
+            echo "STRATA_REQUIREMENTS=$requirements"
+            echo "STRATA_BUILD_REQUIREMENTS=$build_requirements"
+            echo "STRATA_SERVER_ROOT=$server_root"
+          } >> "$GITHUB_ENV"
+          echo "Detected upstream layout: $recipe; server root: $server_root"
       - name: Free space and inspect runner
         if: steps.existing.outputs.published != 'true' || inputs.rebuild_existing == true
         shell: bash
@@ -132,9 +169,13 @@ jobs:
           set -euo pipefail
           python3 -m venv .venv
           . .venv/bin/activate
-          # Use a pinned Linux CUDA build toolchain.
-          python -m pip install --no-cache-dir -r requirements.txt
-          python -m pip install --no-cache-dir cmake==4.2.3 ninja==1.13.2
+          python -m pip install --no-cache-dir -r "$STRATA_REQUIREMENTS"
+          if [[ -n "$STRATA_BUILD_REQUIREMENTS" ]]; then
+            test -f "$STRATA_BUILD_REQUIREMENTS"
+            python -m pip install --no-cache-dir -r "$STRATA_BUILD_REQUIREMENTS"
+          else
+            python -m pip install --no-cache-dir cmake==4.2.3 ninja==1.13.2
+          fi
           export CC=/usr/bin/gcc-13
           export CXX=/usr/bin/g++-13
           export CUDAHOSTCXX=/usr/bin/g++-13
@@ -143,11 +184,11 @@ jobs:
           cmake --version | head -n1
           ninja --version
           gcc-13 -dumpfullversion
-          # Upstream CUDA13 recipe hardcodes min_driver=580.65; correct this
-          # one manifest field for CUDA 13.2 Update 2 before packaging and hashing.
+          # Correct CUDA 13.2 driver metadata before packaging and hashing.
           python3 - <<'PY'
           from pathlib import Path
-          p = Path("packaging/build_cuda_linux.sh")
+          import os
+          p = Path(os.environ["STRATA_BUILD_SCRIPT"])
           data = p.read_text(encoding="utf-8")
           old = "cuda13) archs=${ARCHS:-75;86;89;120}; mindriver=580.65; sm60=OFF ;;"
           new = "cuda13) archs=${ARCHS:-75;86;89;120}; mindriver=595.71.05; sm60=OFF ;;"
@@ -163,7 +204,7 @@ jobs:
           export OUT="$RUNNER_TEMP/strata-package"
           export BUILD="$RUNNER_TEMP/strata-build"
           export BUILD_VISION_DIR="$RUNNER_TEMP/strata-vision-build"
-          sh packaging/build_cuda_linux.sh
+          sh "$STRATA_BUILD_SCRIPT"
           df -h /
 
       - name: Verify, archive, and checksum
@@ -183,7 +224,7 @@ jobs:
           package="$(find "$package_root" -mindepth 1 -maxdepth 1 -type d -print -quit)"
           test -x "$package/strata"
           test -x "$package/strata-vision"
-          python3 strata/packaging/package_engine.py --verify "$package"
+          python3 "strata/$STRATA_PACKAGER" --verify "$package"
           python3 - "$package" <<'PY'
           import json, pathlib, sys
           root = pathlib.Path(sys.argv[1])
@@ -219,8 +260,8 @@ jobs:
           cp -a "$package/." "$bundle_root/$engine_dir/"
 
           # Include the matching Web/API server from the exact upstream tag.
-          cp -a strata/serve strata/strata_control strata/tools "$bundle_root/$server_dir/"
-          cp -a strata/requirements.txt strata/strata.py "$bundle_root/$server_dir/"
+          cp -a "strata/$STRATA_SERVER_ROOT/serve" "strata/$STRATA_SERVER_ROOT/strata_control" "strata/$STRATA_SERVER_ROOT/tools" "$bundle_root/$server_dir/"
+          cp -a "strata/$STRATA_SERVER_ROOT/requirements.txt" "strata/$STRATA_SERVER_ROOT/strata.py" "$bundle_root/$server_dir/"
           printf '%s\n' "$source_commit" > "$bundle_root/$server_dir/SOURCE-SHA.txt"
           test -f "$bundle_root/$server_dir/serve/server.py"
           test -f "$bundle_root/$server_dir/serve/web/index.html"
@@ -258,7 +299,31 @@ jobs:
           external.write_text(payload, encoding="utf-8")
           PY
           # Verify the rewritten manifest through upstream's standard verifier.
-          python3 strata/packaging/package_engine.py --verify "$bundle_root/$engine_dir"
+          # The full original upstream package passed --verify above (including ELF deps).
+          # After splitting, the stock packager's *dependency* check intentionally
+          # fails because CUDA .so files are now in the separate libs archive.
+          # Verify the stripped engine manifest directly and prove that its only
+          # externally bundled dependencies are the three declared CUDA libraries.
+          python3 - "$bundle_root/$engine_dir" "strata/$STRATA_SERVER_ROOT" "strata/$STRATA_PACKAGER" "$bundle_root/libs" <<'PY'
+          import pathlib, sys
+          engine, server_code, packager, libs = map(pathlib.Path, sys.argv[1:])
+          sys.path.insert(0, str(server_code.resolve()))
+          sys.path.insert(0, str(packager.parent.resolve()))
+          from strata_control import engine_component as ec
+          import binary_deps
+
+          component = ec.read_manifest_any(engine)
+          ec.verify(component, full=True)
+          allowed = {"libcudart.so.13", "libcublas.so.13", "libcublasLt.so.13"}
+          if not all((libs / name).is_file() and not (libs / name).is_symlink() for name in allowed):
+              raise SystemExit("Missing or symlinked shared CUDA libraries")
+          missing = binary_deps.uncovered(engine)
+          unexpected = [(entry, name) for entry, name in missing if name not in allowed]
+          if unexpected:
+              raise SystemExit(f"Unexpected Engine dependency outside the split archives: {unexpected}")
+          print(f"Verified stripped Engine ({len(component.files)} manifest files); "
+                f"ELF dependencies resolved by Core, OS/driver or separate CUDA archive: {sorted(set(n for _, n in missing))}")
+          PY
 
           archive="strata-engine-$UPSTREAM_TAG-cuda13.2-sm120-linux-x86_64.tar.gz"
           tar -czf "dist/$archive" -C "$bundle_root" "$engine_dir" "$server_dir"
@@ -356,7 +421,7 @@ jobs:
           - Linux x86-64; CUDA Toolkit **13.2**
           - NVIDIA **sm_120 + compute_120**
           - Minimum NVIDIA driver: **595.71.05** (recorded in the hashed package manifest)
-          - Toolchain: Ubuntu 24.04, GCC 13, CMake 4.2.3, Ninja 1.13.2
+          - Toolchain: Ubuntu 24.04, GCC 13, CMake/Ninja versions recorded in BUILD-SOURCE.txt
           - CUDA userspace libraries are physical files, not symlinks; glibc and the NVIDIA driver remain host-provided
           - Includes \`strata\`, \`strata-vision\`, required CUDA libraries
           - Source commit: \`BUILD-SOURCE.txt\`
