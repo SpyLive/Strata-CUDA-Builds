@@ -8,7 +8,7 @@ on:
         required: false
         type: string
       rebuild_existing:
-        description: "Rebuild existing release to update Engine + Server archive layout"
+        description: "Rebuild existing Release with separate Engine/Server and CUDA libraries archives"
         required: false
         default: false
         type: boolean
@@ -214,7 +214,7 @@ jobs:
           engine_dir="strata-v$compact_version-sm120"
           server_dir="server-v$compact_version"
           bundle_root="$RUNNER_TEMP/strata-unified-release"
-          mkdir -p "$bundle_root/$engine_dir" "$bundle_root/$server_dir"
+          mkdir -p "$bundle_root/$engine_dir" "$bundle_root/$server_dir" "$bundle_root/libs"
           cp -a "$package/." "$bundle_root/$engine_dir/"
 
           # Include the matching Web/API server from the exact upstream tag.
@@ -227,11 +227,43 @@ jobs:
           test -f "$bundle_root/$server_dir/strata_control/__init__.py"
           test -f "$bundle_root/$server_dir/strata.py"
           test -f "$bundle_root/$server_dir/requirements.txt"
+          # The full upstream package has been verified. Separate its CUDA files and
+          # adapt the Engine-only manifest to list exactly the files it still contains.
+          python3 - "$bundle_root/$engine_dir" "$bundle_root/libs" dist/CUDA-LIBS.json <<'PY'
+          import hashlib, json, os, pathlib, sys
+          engine, out, external = (pathlib.Path(s) for s in sys.argv[1:])
+          names = ("libcublasLt.so.13", "libcublas.so.13", "libcudart.so.13")
+          manifest_path = engine / "engine-component.json"
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          entries = manifest["files"]
+          listed = [e["path"] for e in entries if e["path"] in names]
+          if len(listed) != 3 or set(listed) != set(names):
+              raise SystemExit("Engine manifest must list each CUDA library exactly once")
+          libraries = {}
+          for name in names:
+              src, dst = engine / name, out / name
+              if not src.is_file() or src.is_symlink() or dst.exists():
+                  raise SystemExit(f"Invalid CUDA library: {name}")
+              os.replace(src, dst)
+              h = hashlib.sha256()
+              with dst.open("rb") as stream:
+                  while chunk := stream.read(1024 * 1024):
+                      h.update(chunk)
+              libraries[name] = {"sha256": h.hexdigest(), "size": dst.stat().st_size}
+          manifest["files"] = [e for e in entries if e["path"] not in names]
+          manifest_path.write_text(json.dumps(manifest, indent=1) + "\n", encoding="utf-8")
+          payload = json.dumps({"schema_version": 1, "cuda": "13.2", "libraries": libraries}, sort_keys=True, indent=2) + "\n"
+          (out / "CUDA-LIBS.json").write_text(payload, encoding="utf-8")
+          external.write_text(payload, encoding="utf-8")
+          PY
+          # Verify the rewritten manifest through upstream's standard verifier.
           python3 strata/packaging/package_engine.py --verify "$bundle_root/$engine_dir"
 
           archive="strata-engine-$UPSTREAM_TAG-cuda13.2-sm120-linux-x86_64.tar.gz"
           mkdir -p dist
           tar -czf "dist/$archive" -C "$bundle_root" "$engine_dir" "$server_dir"
+          cuda_archive="strata-cuda-libs-cuda13.2-linux-x86_64.tar.gz"
+          tar -czf "dist/$cuda_archive" -C "$bundle_root" libs
           python3 - "dist/$archive" "$engine_dir" "$server_dir" <<'PY'
           import sys, tarfile
           archive, engine, server = sys.argv[1:]
@@ -242,8 +274,7 @@ jobs:
               assert not any(m.issym() or m.islnk() for m in members), "Archive contains symlinks"
               required = (
                   f"{engine}/strata", f"{engine}/strata-vision",
-                  f"{engine}/libcudart.so.13", f"{engine}/libcublas.so.13",
-                  f"{engine}/libcublasLt.so.13", f"{engine}/engine-component.json",
+                  f"{engine}/engine-component.json",
                   f"{engine}/SYSTEM-LIBS.txt",
                   f"{server}/serve/server.py", f"{server}/serve/web/index.html",
                   f"{server}/serve/web/app.js", f"{server}/strata.py",
@@ -252,10 +283,41 @@ jobs:
               names = {m.name for m in members}
               missing = [name for name in required if name not in names]
               assert not missing, f"Missing archive entries: {missing}"
-          print(f"Verified archive: {engine}/ + {server}/")
+              assert not any(m.name.rsplit("/", 1)[-1] in {"libcudart.so.13", "libcublas.so.13", "libcublasLt.so.13"} for m in members), "CUDA libraries found in Engine archive"
+          print(f"Verified Engine/Server archive: {engine}/ + {server}/")
           PY
-          (cd dist && sha256sum "$archive" > SHA256SUMS.txt)
-          printf 'Upstream: Niko1221/Strata %s\nCommit: %s\nCUDA Toolkit: 13.2\nArch: sm_120 + compute_120\nVision: yes\nMinimum NVIDIA driver: 595.71.05 (one-line patch to upstream recipe)\nArchive folders: %s/ %s/\nSigned: no\n' \
+          python3 - "dist/$cuda_archive" dist/CUDA-LIBS.json <<'PY'
+          import hashlib, json, pathlib, sys, tarfile
+          archive, metadata = sys.argv[1:]
+          raw = pathlib.Path(metadata).read_bytes()
+          info = json.loads(raw)
+          names = ("libcublasLt.so.13", "libcublas.so.13", "libcudart.so.13")
+          if info.get("schema_version") != 1 or info.get("cuda") != "13.2" or set(info.get("libraries", {})) != set(names):
+              raise SystemExit("Invalid CUDA-LIBS.json")
+          with tarfile.open(archive, "r:gz") as tar:
+              members = tar.getmembers()
+              if any(not (m.isfile() or m.isdir()) for m in members):
+                  raise SystemExit("CUDA archive contains symlinks/special entries")
+              files = {m.name for m in members if m.isfile()}
+              expected = {"libs/CUDA-LIBS.json"} | {f"libs/{name}" for name in names}
+              if files != expected or {m.name.split("/", 1)[0] for m in members} != {"libs"}:
+                  raise SystemExit(f"Unexpected CUDA archive members: {files ^ expected}")
+              if tar.extractfile("libs/CUDA-LIBS.json").read() != raw:
+                  raise SystemExit("Embedded CUDA-LIBS.json differs from standalone file")
+              for name in names:
+                  digest = hashlib.sha256()
+                  size = 0
+                  with tar.extractfile(f"libs/{name}") as stream:
+                      while chunk := stream.read(1024 * 1024):
+                          digest.update(chunk)
+                          size += len(chunk)
+                  value = info["libraries"][name]
+                  if size != value["size"] or digest.hexdigest() != value["sha256"]:
+                      raise SystemExit(f"CUDA library checksum mismatch: {name}")
+          print("Separate CUDA archive and embedded CUDA-LIBS.json verified")
+          PY
+          (cd dist && sha256sum "$archive" "$cuda_archive" CUDA-LIBS.json > SHA256SUMS.txt)
+          printf 'Upstream: Niko1221/Strata %s\nCommit: %s\nCUDA Toolkit: 13.2\nArch: sm_120 + compute_120\nVision: yes\nMinimum NVIDIA driver: 595.71.05 (one-line patch to upstream recipe)\nEngine/Server folders: %s/ %s/\nCUDA folder: libs/\nSigned: no\n' \
             "$UPSTREAM_TAG" "$source_commit" "$engine_dir" "$server_dir" > dist/BUILD-SOURCE.txt
           {
             printf 'OS: '; . /etc/os-release; printf '%s %s\n' "$NAME" "$VERSION_ID"
@@ -265,11 +327,14 @@ jobs:
             printf 'Ninja: '; strata/.venv/bin/ninja --version
             printf 'NVCC: '; /usr/local/cuda-13.2/bin/nvcc --version | grep 'release 13.2'
           } >> dist/BUILD-SOURCE.txt
-          if (( $(stat -c%s "dist/$archive") >= 2147483648 )); then
-            echo "::error::Archive exceeds GitHub's 2 GiB per-asset limit"
-            exit 1
-          fi
+          for file in "dist/$archive" "dist/$cuda_archive"; do
+            if (( $(stat -c%s "$file") >= 2147483648 )); then
+              echo "::error::Archive exceeds GitHub's 2 GiB per-asset limit: $file"
+              exit 1
+            fi
+          done
           echo "archive=dist/$archive" >> "$GITHUB_OUTPUT"
+          echo "cuda_archive=dist/$cuda_archive" >> "$GITHUB_OUTPUT"
           du -h dist/*
           df -h /
 
@@ -281,6 +346,7 @@ jobs:
           RELEASE_TAG: ${{ steps.upstream.outputs.release_tag }}
           UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
           ARCHIVE: ${{ steps.package.outputs.archive }}
+          CUDA_ARCHIVE: ${{ steps.package.outputs.cuda_archive }}
           REBUILD_EXISTING: ${{ inputs.rebuild_existing }}
         run: |
           set -euo pipefail
@@ -296,7 +362,8 @@ jobs:
           - Source commit: \`BUILD-SOURCE.txt\`
           - Archive SHA-256: \`SHA256SUMS.txt\`
           - **Unsigned**; not part of the official Strata signed update feed
-          - One archive: strata-vNNNN-sm120/ (Engine + Vision) and server-vNNNN/ (Python API + Web UI)
+          - Engine/Server archive keeps the original strata-engine-vX.Y.Z-cuda13.2-sm120-linux-x86_64.tar.gz filename
+          - Separate CUDA archive contains libs/ with three NVIDIA libraries and CUDA-LIBS.json (also published standalone)
           - Server source: serve/, strata_control/, tools/, strata.py, requirements.txt, SOURCE-SHA.txt
           - **No GPU execution test** on the GitHub runner
           EOF
@@ -307,20 +374,20 @@ jobs:
             fi
             # Keep existing release until the complete new archive is validated.
             gh release upload "$RELEASE_TAG" \
-              "$ARCHIVE" dist/SHA256SUMS.txt dist/BUILD-SOURCE.txt \
+              "$ARCHIVE" "$CUDA_ARCHIVE" dist/CUDA-LIBS.json dist/SHA256SUMS.txt dist/BUILD-SOURCE.txt \
               --repo "$GITHUB_REPOSITORY" --clobber
             gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
               --notes-file "$RUNNER_TEMP/release-notes.md"
           else
             gh release create "$RELEASE_TAG" \
-              "$ARCHIVE" dist/SHA256SUMS.txt dist/BUILD-SOURCE.txt \
+              "$ARCHIVE" "$CUDA_ARCHIVE" dist/CUDA-LIBS.json dist/SHA256SUMS.txt dist/BUILD-SOURCE.txt \
               --repo "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" \
               --title "Strata $UPSTREAM_TAG - CUDA 13.2 sm_120" \
               --notes-file "$RUNNER_TEMP/release-notes.md" --prerelease
           fi
           gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
-            --json assets --jq '.assets | length' | grep -qx '3'
+            --json assets --jq '.assets | length' | grep -qx '5'
 
       - name: Retain only the three latest successful builds
         if: success() && (steps.existing.outputs.published != 'true' || inputs.rebuild_existing == true)
