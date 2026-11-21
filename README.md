@@ -60,16 +60,16 @@ To compile manually, open **Actions → Strata CUDA 13.2 / sm_120 → Run workfl
 
 The updater only accepts Releases containing the full split format. Earlier unsplit archives are not treated as compatible; there is no legacy fallback.
 
-## Automatic updater v1.1.0
+## Automatic updater v1.1.1
 
-[strata-updater.py](strata-updater.py) is a single-file, self-updating systemd service running as the Strata service user. Every **12 hours** it checks GitHub for new Releases and an updated version of its own script. An update is prepared and verified first, then waits for the model to unload and for in-flight requests to finish. The updater stops Strata only when safe, installs Engine and Server, verifies the HTTP service, and rolls back failed installations.
+[strata-updater.py](strata-updater.py) is a single-file, self-updating systemd service running as the Strata service user. Every **6 hours** it checks GitHub for new Releases and an updated version of its own script. While waiting for a loaded model to unload, it also checks for newer Releases at the same interval and switches to the newest package before installation. An update is prepared and verified first, then waits for the model to unload and for in-flight requests to finish. The updater stops Strata only when safe, installs Engine and Server, verifies the HTTP service, and rolls back failed installations.
 
 **Separate CUDA library policy:**
 
 1. Download the tiny standalone CUDA-LIBS.json and verify it against SHA256SUMS.txt and the GitHub asset digest.
 2. Compare the published JSON byte-for-byte with ~/strata/libs/CUDA-LIBS.json.
 3. If the local JSON is missing and three existing CUDA libraries are present, compute their SHA-256 **once**, create the canonical JSON atomically, and then compare.
-4. When JSON matches, **do not rehash local libraries and do not download the CUDA archive**. Reuse the existing ~/strata/libs/ directory.
+4. When JSON matches, **compare manifest metadata without rehashing local libraries or downloading the CUDA archive**. Reuse the existing ~/strata/libs/ directory.
 5. If JSON differs or libraries are absent, download the separate CUDA archive, verify each newly downloaded library's SHA-256 and size, and stage it.
 6. Replace ~/strata/libs/ only when necessary. For a failed installation, restore the old CUDA library directory together with Engine and Server. When libraries match, they are never replaced.
 
