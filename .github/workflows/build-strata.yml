@@ -442,17 +442,32 @@ jobs:
               "$ARCHIVE" "$CUDA_ARCHIVE" dist/CUDA-LIBS.json dist/SHA256SUMS.txt dist/BUILD-SOURCE.txt \
               --repo "$GITHUB_REPOSITORY" --clobber
             gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
-              --notes-file "$RUNNER_TEMP/release-notes.md"
+              --notes-file "$RUNNER_TEMP/release-notes.md" --prerelease=false
           else
             gh release create "$RELEASE_TAG" \
               "$ARCHIVE" "$CUDA_ARCHIVE" dist/CUDA-LIBS.json dist/SHA256SUMS.txt dist/BUILD-SOURCE.txt \
               --repo "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" \
               --title "Strata $UPSTREAM_TAG - CUDA 13.2 sm_120" \
-              --notes-file "$RUNNER_TEMP/release-notes.md" --prerelease
+              --notes-file "$RUNNER_TEMP/release-notes.md" --latest=false
           fi
           gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
             --json assets --jq '.assets | length' | grep -qx '5'
+          # Promote only the highest published version; rebuilding an older tag
+          # must never override the repository's current Latest release.
+          newest_tag="$(
+            gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 \
+              --json tagName,isDraft \
+              | jq -r --arg prefix "$RELEASE_PREFIX" \
+                  '.[] | select(.isDraft == false and (.tagName | startswith($prefix))) | .tagName' \
+              | sort -V | tail -n 1
+          )"
+          if [[ "$RELEASE_TAG" == "$newest_tag" ]]; then
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --latest
+            echo "Published $RELEASE_TAG as Latest"
+          else
+            echo "Published $RELEASE_TAG; keeping newer version $newest_tag as Latest"
+          fi
 
       - name: Retain only the three latest successful builds
         if: success() && (steps.existing.outputs.published != 'true' || inputs.rebuild_existing == true)
