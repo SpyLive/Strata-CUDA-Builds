@@ -27,12 +27,12 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 REPO = "SpyLive/Strata-CUDA-Builds"
 PREFIX = "strata-sm120-cuda13.2-"
 SERVICE = "strata.service"
 UPDATER = "strata-updater.service"
-INTERVAL = 12 * 60 * 60
+INTERVAL = 6 * 60 * 60
 POLL = 60
 HEALTH_TIMEOUT = 90
 MAX_ARCHIVE_BYTES = 2 * 1024**3
@@ -271,7 +271,7 @@ def read_cuda_asset(asset, checks):
 
 
 def local_cuda_manifest(root):
-    """Trust installed JSON; compute local library hashes only if JSON is missing."""
+    """Compare existing JSON; hash large libraries only if metadata is missing."""
     folder = root / "libs"
     if not folder.is_dir() or folder.is_symlink():
         return None
@@ -281,8 +281,11 @@ def local_cuda_manifest(root):
     if manifest.exists():
         if not manifest.is_file():
             raise RuntimeError("Local CUDA-LIBS.json is not a file")
-        log("[LIBS] Existing CUDA-LIBS.json found; no local library hash check")
-        return manifest.read_bytes()
+        payload = manifest.read_bytes()
+        if len(payload) > MAX_CUDA_JSON:
+            raise RuntimeError("Local CUDA-LIBS.json exceeds configured size limit")
+        log("[LIBS] Comparing existing CUDA-LIBS.json with published manifest; .so files are not rehashed")
+        return payload
     entries = {}
     for name in CUDA_LIBS:
         file = folder / name
@@ -483,12 +486,27 @@ def can_stop(base):
         isinstance(activity, dict) and activity.get("in_flight") == 0
 
 
-def wait_for_idle(systemctl, base):
+class SupersededRelease(RuntimeError):
+    """A newer compatible release superseded a staged, waiting update."""
+
+
+def check_for_superseded_release(expected_tag, expected_sha):
+    _, latest, archive, *_ = releases()
+    latest_tag = latest["tag_name"]
+    if (tuple(map(int, TAG_RE.fullmatch(latest_tag).group(1).split("."))) >
+            tuple(map(int, TAG_RE.fullmatch(expected_tag).group(1).split(".")))):
+        raise SupersededRelease(f"{expected_tag} superseded by {latest_tag}")
+    if latest_tag == expected_tag and asset_digest(archive) != expected_sha:
+        raise SupersededRelease(f"{expected_tag} archive has been replaced")
+
+
+def wait_for_idle(systemctl, base, candidate_tag, candidate_sha):
     last_report = -float("inf")
     last_self_check = time.monotonic()
+    last_release_check = time.monotonic()
     while True:
-        # While waiting for the model, continue checking updater source every 12 hours.
-        # No Strata files have been switched at this point.
+        # Check both the updater source and newer Strata releases while the model runs.
+        # Neither check stops Strata or modifies active files.
         now = time.monotonic()
         requested = SELF_UPDATE_REQUESTED.is_set()
         if requested or now - last_self_check >= INTERVAL:
@@ -499,6 +517,16 @@ def wait_for_idle(systemctl, base):
                     log("[SELF-UPDATE] Updater already current")
             except Exception as exc:
                 log(f"[SELF-UPDATE] Check failed: {exc}")
+        if WAKE.is_set() or now - last_release_check >= INTERVAL:
+            WAKE.clear()
+            last_release_check = now
+            try:
+                check_for_superseded_release(candidate_tag, candidate_sha)
+                log(f"[CHECK] {candidate_tag} is still the newest compatible release")
+            except SupersededRelease:
+                raise
+            except Exception as exc:
+                log(f"[CHECK] Unable to refresh release while waiting: {exc}")
         active = service_state(systemctl)
         if active == "inactive":
             log("[WAIT] Strata is stopped; a temporary verification start will follow installation")
@@ -517,7 +545,7 @@ def wait_for_idle(systemctl, base):
         if now - last_report >= 5 * 60:
             log(f"[WAIT] {message}; checking every {POLL}s")
             last_report = now
-        time.sleep(POLL)
+        WAKE.wait(POLL)
 
 
 def confirm_started(systemctl, base):
@@ -661,7 +689,7 @@ def install_release(root, state, tag, digest, systemctl, api_url, cuda_json_sha,
             raise RuntimeError("Verified CUDA staging directory is missing")
     elif not libs.is_dir() or any(not (libs / n).is_file() for n in CUDA_LIBS):
         raise RuntimeError("Installed CUDA libraries are missing")
-    original_active = wait_for_idle(systemctl, api_url)
+    original_active = wait_for_idle(systemctl, api_url, tag, digest)
     backup = temp_backup(root)
     if backup.exists():
         raise RuntimeError("Unresolved backup directory; refusing update")
@@ -797,6 +825,9 @@ def install_candidate(root, state, release, archive, cuda_archive, cuda_meta, ch
     try:
         install_release(root, state, tag, core_sha, systemctl, api_url,
                         hashlib.sha256(published).hexdigest(), update_libs)
+    except SupersededRelease as exc:
+        log(f"[CHECK] {exc}; preparing latest release without stopping Strata")
+        return True
     except Exception as exc:
         state["failed_digest"] = core_sha
         state.pop("pending", None)
@@ -826,7 +857,7 @@ def run_daemon(root, api_url):
         WAKE.set()
     signal.signal(signal.SIGUSR1, wake)
     signal.signal(signal.SIGUSR2, update_requested)
-    log(f"[START] Updater {VERSION} started; release checks every 12 hours")
+    log(f"[START] Updater {VERSION} started; release checks every 6 hours")
     while True:
         try:
             restore_transaction(root, state, systemctl)
@@ -841,8 +872,10 @@ def run_daemon(root, api_url):
             _, release, archive, cuda_archive, cuda_meta, checksums = releases()
             state["last_checked_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
             save_state(state)
-            install_candidate(root, state, release, archive, cuda_archive, cuda_meta,
-                              checksums, systemctl, api_url)
+            superseded = install_candidate(root, state, release, archive, cuda_archive, cuda_meta,
+                                           checksums, systemctl, api_url)
+            if superseded:
+                continue
         except Exception as exc:
             log(f"[ERROR] Update check failed: {exc}")
         WAKE.wait(INTERVAL)
