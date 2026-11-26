@@ -27,12 +27,12 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 REPO = "SpyLive/Strata-CUDA-Builds"
 PREFIX = "strata-sm120-cuda13.2-"
 SERVICE = "strata.service"
 UPDATER = "strata-updater.service"
-INTERVAL = 3 * 60 * 60
+INTERVAL = 6 * 60 * 60
 POLL = 60
 HEALTH_TIMEOUT = 90
 MAX_ARCHIVE_BYTES = 2 * 1024**3
@@ -99,6 +99,22 @@ def run_command(args, *, timeout=150, check=True):
 def service_state(systemctl):
     result = run_command([systemctl, "show", "-p", "ActiveState", "--value", SERVICE])
     return result.stdout.strip()
+
+
+def stopped_after_stop(systemctl):
+    """Accept failed status only if a completed stop left no main/control PID."""
+    result = run_command([systemctl, "show", "-p", "ActiveState",
+                          "-p", "MainPID", "-p", "ControlPID", "-p", "Result", SERVICE])
+    info = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+    state = info.get("ActiveState", "unknown")
+    stopped = (state in ("inactive", "failed")
+               and info.get("MainPID") == "0" and info.get("ControlPID") == "0")
+    if not stopped:
+        log(f"[STOP] Strata not stopped: state={state}, main_pid={info.get('MainPID')}, "
+            f"control_pid={info.get('ControlPID')}, result={info.get('Result')}")
+    elif state == "failed":
+        log(f"[STOP] Strata exited with result={info.get('Result')}; no main/control PID remains")
+    return stopped
 
 
 def control(systemctl, verb):
@@ -673,6 +689,10 @@ def restore_transaction(root, state, systemctl):
     log("[ROLLBACK] Previous working directories restored")
 
 
+class ReleaseHealthError(RuntimeError):
+    """A newly installed release failed its startup health check."""
+
+
 def install_release(root, state, tag, digest, systemctl, api_url, cuda_json_sha, replace_libs):
     engine_name, server_name = version_dirs(tag)
     originals = (root / "strata-sm120", root / "server")
@@ -703,7 +723,7 @@ def install_release(root, state, tag, digest, systemctl, api_url, cuda_json_sha,
             control(systemctl, "stop")
         else:
             log("[UPDATE] Strata was stopped; retaining its original stopped state")
-        if service_state(systemctl) != "inactive":
+        if not stopped_after_stop(systemctl):
             raise RuntimeError("Strata did not stop cleanly")
         log(f"[INSTALL] Installing {tag}: Engine and Server")
         backup.mkdir(mode=0o700)
@@ -728,13 +748,17 @@ def install_release(root, state, tag, digest, systemctl, api_url, cuda_json_sha,
             log("[LIBS] Retaining existing CUDA libraries")
         log("[START] Starting Strata for verification")
         control(systemctl, "start")
-        confirm_started(systemctl, api_url)
+        try:
+            confirm_started(systemctl, api_url)
+        except RuntimeError as exc:
+            raise ReleaseHealthError(f"New release failed health check: {exc}") from exc
         state.update(current_tag=tag, current_sha256=digest, cuda_json_sha256=cuda_json_sha,
                      previous_tag=previous_tag,
                      previous_dirs=list(previous_dirs) if previous_dirs else None,
                      installed_at=dt.datetime.now(dt.timezone.utc).isoformat())
         state.pop("pending", None)
         state.pop("failed_digest", None)
+        state.pop("failed_reason", None)
         state["transaction"]["phase"] = "committed"
         save_state(state)
         # The new installation is now committed. Cleanup errors must not roll back
@@ -828,11 +852,15 @@ def install_candidate(root, state, release, archive, cuda_archive, cuda_meta, ch
     except SupersededRelease as exc:
         log(f"[CHECK] {exc}; preparing latest release without stopping Strata")
         return True
-    except Exception as exc:
+    except ReleaseHealthError as exc:
         state["failed_digest"] = core_sha
+        state["failed_reason"] = "healthcheck"
         state.pop("pending", None)
         save_state(state)
-        raise RuntimeError(f"Installation failed; rollback attempted: {exc}") from exc
+        raise RuntimeError(f"New release health check failed; rollback attempted: {exc}") from exc
+    except Exception as exc:
+        # Systemd stop failures must not permanently blacklist a valid archive.
+        raise RuntimeError(f"Installation interrupted; rollback attempted: {exc}") from exc
 
 def run_daemon(root, api_url):
     systemctl = shutil.which("systemctl")
@@ -849,6 +877,11 @@ def run_daemon(root, api_url):
         raise RuntimeError("An updater process is already running") from exc
     state = read_state()
     restore_transaction(root, state, systemctl)
+    if state.get("failed_digest") and state.get("failed_reason") != "healthcheck":
+        # v1.1.1 recorded temporary stop failures as invalid releases.
+        state.pop("failed_digest", None)
+        save_state(state)
+        log("[STATE] Cleared legacy failed_digest from unclassified failure")
 
     def wake(signum, frame):
         WAKE.set()
