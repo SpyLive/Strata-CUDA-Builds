@@ -60,9 +60,9 @@ To compile manually, open **Actions → Strata CUDA 13.2 / sm_120 → Run workfl
 
 The updater only accepts Releases containing the full split format. Earlier unsplit archives are not treated as compatible; there is no legacy fallback.
 
-## Automatic updater v1.1.1
+## Automatic updater v1.1.2
 
-[strata-updater.py](strata-updater.py) is a single-file, self-updating systemd service running as the Strata service user. Every **6 hours** it checks GitHub for new Releases and an updated version of its own script. While waiting for a loaded model to unload, it also checks for newer Releases at the same interval and switches to the newest package before installation. An update is prepared and verified first, then waits for the model to unload and for in-flight requests to finish. The updater stops Strata only when safe, installs Engine and Server, verifies the HTTP service, and rolls back failed installations.
+[strata-updater.py](strata-updater.py) is a single-file, self-updating systemd service running as the Strata service user. Every **6 hours** it checks GitHub for new Releases and an updated version of its own script. While waiting for a loaded model to unload, it also checks for newer Releases at the same interval and switches to the newest package before installation. An update is prepared and verified first, then waits for the model to unload and for in-flight requests to finish. The updater waits for the model to unload, then stops Strata, installs Engine and Server, verifies the HTTP service, and rolls back failed installations. Temporary systemd stop failures do not blacklist verified archives.
 
 **Separate CUDA library policy:**
 
